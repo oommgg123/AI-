@@ -1,0 +1,32 @@
+// awa 版本信息资源（用户 174 轮：版本号/著作人写入 Windows 软件信息）
+// 文件为 UTF-8 with BOM（windres 正确解析中文 → 转 UTF-16 VERSIONINFO）
+#include <windows.h>
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION     1,178,0,0
+ PRODUCTVERSION  1,178,0,0
+ FILEFLAGSMASK   0x3fL
+ FILEFLAGS       0x0L
+ FILEOS          VOS_NT_WINDOWS32
+ FILETYPE        VFT_APP
+ FILESUBTYPE     0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName",      "大章鱼用ai做的"
+            VALUE "FileDescription",  "awa - 3D 模型查看器"
+            VALUE "FileVersion",      "1.178"
+            VALUE "InternalName",     "awa"
+            VALUE "LegalCopyright",   "大章鱼用ai做的"
+            VALUE "OriginalFilename", "vulkan-blank-optimized.exe"
+            VALUE "ProductName",      "awa"
+            VALUE "ProductVersion",   "1.178"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END

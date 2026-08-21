@@ -1,0 +1,32 @@
+// awa 版本信息资源模板（由 tools/gen_version.py 生成，来源 CMakeLists 的 VKB_VERSION）
+// 文件为 GBK 编码（windres 按系统 ANSI 解析中文）；更新版本请改 CMakeLists.txt 顶部 VKB_VERSION
+#include <windows.h>
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION     @@RCVERSION@@
+ PRODUCTVERSION  @@RCVERSION@@
+ FILEFLAGSMASK   0x3fL
+ FILEFLAGS       0x0L
+ FILEOS          VOS_NT_WINDOWS32
+ FILETYPE        VFT_APP
+ FILESUBTYPE     0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName",      "大章鱼用ai做的"
+            VALUE "FileDescription",  "3d动画制作器"
+            VALUE "FileVersion",      "@@VERSION@@"
+            VALUE "InternalName",     "awa"
+            VALUE "LegalCopyright",   "大章鱼用ai做的"
+            VALUE "OriginalFilename", "vulkan-blank-optimized.exe"
+            VALUE "ProductName",      "awa"
+            VALUE "ProductVersion",   "@@VERSION@@"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END

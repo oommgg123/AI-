@@ -1,0 +1,8 @@
+// ============================================================================
+//   版本号自动生成头（由 tools/gen_version.py 生成，来源 CMakeLists 的 VKB_VERSION）
+//   不要手动编辑本文件；更新版本请改 CMakeLists.txt 顶部 VKB_VERSION
+// ============================================================================
+#pragma once
+
+#define VKB_VERSION_STR "@@VERSION@@"
+#define VKB_VERSION_RC  "@@RCVERSION@@"

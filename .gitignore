@@ -1,0 +1,46 @@
+# ===== 构建产物 =====
+build/
+build-debug/
+out/
+cmake-build-*/
+
+# ===== 发布/分发目录（含外部 DLL、皮肤、示例，体积大且机器相关）=====
+dist/
+优化版本/
+优化版本-Win7/
+release/
+publish/
+
+# ===== 编译缓存/中间产物 =====
+*.o
+*.obj
+*.exe
+*.dll
+*.ilk
+*.pdb
+*.exp
+*.lib
+generated/
+
+# ===== 本地资源/素材（如需版本管理请移除对应行）=====
+资源/
+assets/
+
+# ===== 系统/IDE 无关文件 =====
+*.reg
+*.log
+.DS_Store
+Thumbs.db
+
+# ===== WorkBuddy 本地状态（不入库）=====
+.workbuddy/
+
+# ===== Python/脚本缓存 =====
+__pycache__/
+*.pyc
+
+# ===== 临时文件 =====
+*.tmp
+*.bak
+*.old
+awa_old.exe

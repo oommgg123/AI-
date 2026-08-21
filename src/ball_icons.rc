@@ -1,0 +1,11 @@
+// Round277：左上角 3 球按钮图标——从左到右 1/2/3 对应按钮 1/2/3（线框/实体/暂定）
+// Round297：顶栏变换按钮图标 4/5/6（移动/旋转/缩放）
+// windres 不支持中文路径 → CMakeLists file(COPY) 把 资源/1.png~6.png 复制到 build/ball_icons/，
+// 这里引用 build/ball_icons/N.png 等（windres 工作目录 = build/）
+#include "resource.h"
+ID_BTN_ICON_1 RCDATA "ball_icons/1.png"
+ID_BTN_ICON_2 RCDATA "ball_icons/2.png"
+ID_BTN_ICON_3 RCDATA "ball_icons/3.png"
+ID_BTN_ICON_4 RCDATA "ball_icons/4.png"
+ID_BTN_ICON_5 RCDATA "ball_icons/5.png"
+ID_BTN_ICON_6 RCDATA "ball_icons/6.png"
