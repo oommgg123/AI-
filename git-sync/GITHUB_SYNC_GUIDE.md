@@ -1,7 +1,7 @@
 # GitHub 上传教程（vulkan-blank / awa）
 
 本文件教你如何把本项目推送到 GitHub 仓库 `oommgg123/AI`。
-本地仓库已初始化（`main` 分支），并配好了远程 `origin` 与同步脚本 `tools/git_sync.sh`。
+本地仓库已初始化（`main` 分支），并配好了远程 `origin` 与同步脚本 `git-sync/git_sync.sh`。
 你只需完成「创建仓库 + 配置鉴权」两步，之后推送是自动/一键的。
 
 ---
@@ -87,13 +87,13 @@ git push -u origin main
 ### 一键同步（手动）
 任何时候想上传，直接运行：
 ```bash
-bash tools/git_sync.sh
+bash git-sync/git_sync.sh
 ```
 脚本会：① 暂存全部源码改动 ② 把 `CMakeLists.txt` 的版本号补丁位 +1（如 `1.242.0` → `1.242.1`）③ 提交 ④ 推送。
 若你用 Token 方式，先 `export GITHUB_TOKEN=...` 再运行。
 
 ### 自动同步
-- **每 10 轮对话**：主代理会在满 10 轮代码改动后自动跑一次上面的脚本（计数器在 `tools/.sync_rounds`）。
+- **每 10 轮对话**：主代理会在满 10 轮代码改动后自动跑一次上面的脚本（计数器在 `git-sync/.sync_rounds`）。
 - **每周兜底**：系统里建了一个「每周」自动任务（当前为暂停态），等你配好鉴权后，可在自动任务列表里把它启用；它也会跑同一个脚本。
 
 ---

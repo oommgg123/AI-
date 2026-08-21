@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # git_sync.sh —— 自动同步到 GitHub：提交全部改动 + 自增补丁版本号 + 推送
-# 用法： bash tools/git_sync.sh
+# 用法： bash git-sync/git_sync.sh
 # 依赖：git 已在 PATH；远程 origin 已配置（或设置环境变量 GIT_REMOTE / GITHUB_TOKEN）
 set -u
 
-# 切到仓库根（脚本位于 <root>/tools/）
+# 切到仓库根（脚本位于 <root>/git-sync/）
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || { echo "[git_sync] 无法进入仓库根目录"; exit 1; }
 
