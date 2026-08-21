@@ -22,9 +22,11 @@ publish/
 *.lib
 generated/
 
-# ===== 本地资源/素材（如需版本管理请移除对应行）=====
-资源/
-assets/
+# ===== 资源/素材（入库：源码 + 素材）=====
+# 素材目录纳入版本管理；其中系统运行库(dll，已被下方 *.dll 排除)与 swiftshader ICD 配置(json)仍排除
+资源/*.json
+# 编译产物着色器(spv)不入库（着色器源在 src/shaders/*.vert/.frag）
+*.spv
 
 # ===== 系统/IDE 无关文件 =====
 *.reg
