@@ -221,6 +221,7 @@ bool JsonParse(const std::string& s, JsonValue& out) {
 bool BuildSceneObject(std::vector<std::array<float, 3>>& pos,
                       const std::vector<int32_t>& tris,
                       const std::vector<std::array<float, 3>>* fileNrm,
+                      const std::vector<std::vector<int32_t>>* faces,
                       SceneObject& out) {
     if (pos.empty() || tris.size() < 3) return false;
     // 归一化：XZ 中心化 + 最低点贴网格（y→0）
@@ -235,7 +236,8 @@ bool BuildSceneObject(std::vector<std::array<float, 3>>& pos,
     for (auto& p : pos) { p[0] -= cx; p[1] -= minY; p[2] -= cz; }
     const int npos = static_cast<int>(pos.size());
 
-    // 线框：去重边
+    // 线框：去重边。优先原始面（faces）环形连边→四边形只画 4 边、不含三角对角线；
+    // 无 faces（STL/glTF 天然三角面）回退从三角化 tris 提边（三角边属正常形态）。
     std::unordered_set<uint64_t> edgeSet;
     edgeSet.reserve(tris.size() * 2);
     const auto addEdge = [&](int p, int q) {
@@ -247,10 +249,21 @@ bool BuildSceneObject(std::vector<std::array<float, 3>>& pos,
             out.wireIndices.push_back(static_cast<uint32_t>(q));
         }
     };
-    for (size_t i = 0; i + 2 < tris.size(); i += 3) {
-        const int a = tris[i], b = tris[i + 1], c = tris[i + 2];
-        if (a < 0 || b < 0 || c < 0 || a >= npos || b >= npos || c >= npos) continue;
-        addEdge(a, b); addEdge(b, c); addEdge(c, a);
+    if (faces && !faces->empty()) {
+        for (const auto& f : *faces) {
+            const int m = static_cast<int>(f.size());
+            for (int k = 0; k < m; ++k) {
+                const int p = f[k], q = f[(k + 1) % m];
+                if (p < 0 || q < 0 || p >= npos || q >= npos) continue;
+                addEdge(p, q);   // 仅环形边：四边形不含内部 0-2 对角线
+            }
+        }
+    } else {
+        for (size_t i = 0; i + 2 < tris.size(); i += 3) {
+            const int a = tris[i], b = tris[i + 1], c = tris[i + 2];
+            if (a < 0 || b < 0 || c < 0 || a >= npos || b >= npos || c >= npos) continue;
+            addEdge(a, b); addEdge(b, c); addEdge(c, a);
+        }
     }
     out.wireVerts.reserve(static_cast<size_t>(npos));
     for (int i = 0; i < npos; ++i) {
@@ -365,7 +378,7 @@ bool ParseSTL(const wchar_t* path, SceneObject& out) {
         }
     }
     if (pos.size() < 3) return false;
-    return BuildSceneObject(pos, tris, nullptr, out);
+    return BuildSceneObject(pos, tris, nullptr, nullptr, out);
 }
 
 // ---------------- glTF / GLB ----------------
@@ -575,7 +588,7 @@ bool ParseGLTF(const wchar_t* path, SceneObject& out) {
                 }
             }
         }
-        if (BuildSceneObject(pos, tris, nrm.empty() ? nullptr : &nrm, out)) {
+        if (BuildSceneObject(pos, tris, nrm.empty() ? nullptr : &nrm, nullptr, out)) {
             found = true;
             if (const JsonValue* name = m.Find("name")) out.name.assign(name->str.begin(), name->str.end());
             break;
@@ -769,6 +782,7 @@ bool ParseFBX(const wchar_t* path, SceneObject& out) {
                 pos.push_back({verts[i], verts[i + 1], verts[i + 2]});
             // 多边形索引（负值 = -idx-1 表示多边形结束）→ 三角化 fan
             std::vector<int32_t> tris;
+            std::vector<std::vector<int32_t>> faces;   // Round353：保留原始多边形（用于四边线框）
             const size_t nPos = pos.size();
             size_t i = 0;
             while (i < polyIdx.size()) {
@@ -785,10 +799,11 @@ bool ParseFBX(const wchar_t* path, SceneObject& out) {
                             a >= static_cast<int>(nPos) || b >= static_cast<int>(nPos) || c2 >= static_cast<int>(nPos)) continue;
                         tris.push_back(a); tris.push_back(b); tris.push_back(c2);
                     }
+                    faces.push_back(poly);   // 原始多边形（含四边形）→ 线框只画环形边
                 }
             }
             if (tris.empty()) continue;
-            if (BuildSceneObject(pos, tris, nullptr, out)) {
+            if (BuildSceneObject(pos, tris, nullptr, &faces, out)) {
                 out.name = L"FBX 模型";
                 return true;
             }

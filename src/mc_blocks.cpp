@@ -928,6 +928,18 @@ void McBuildMergedMesh(const McBlockGrid& grid, const McAtlas& atlas, SceneObjec
                     out.solidIndices.push_back(base + 0);
                     out.solidIndices.push_back(base + 2);
                     out.solidIndices.push_back(base + 3);
+                    // Round353：同步生成四边线框（不含 solid 三角对角线 0-2）：4 顶点 + 4 边环形
+                    const int wb = static_cast<int>(out.wireVerts.size());
+                    for (int i = 0; i < 4; ++i) {
+                        VertexSolid vs = out.solidVerts[base + i];
+                        vs.normal[0] = 0; vs.normal[1] = 1; vs.normal[2] = 0;
+                        vs.color[0] = 1; vs.color[1] = 1; vs.color[2] = 1; vs.color[3] = 1;
+                        out.wireVerts.push_back(vs);
+                    }
+                    out.wireIndices.push_back(wb + 0); out.wireIndices.push_back(wb + 1);
+                    out.wireIndices.push_back(wb + 1); out.wireIndices.push_back(wb + 2);
+                    out.wireIndices.push_back(wb + 2); out.wireIndices.push_back(wb + 3);
+                    out.wireIndices.push_back(wb + 3); out.wireIndices.push_back(wb + 0);
                     // 清除已合并
                     for (int j = 0; j < h; ++j)
                         for (int i = 0; i < w; ++i) mask[(c + j) * Su + (b + i)] = -1;

@@ -207,6 +207,52 @@ void BuildModelMatrix(const SceneObject& o, float out[16]) {
     MatMul4(T, SR, out);        // out = T·S·R（世界轴缩放，围绕物体原点）
 }
 
+// Round355：由本地欧拉角构造旋转矩阵 R=Rz·Ry·Rx（与 BuildModelMatrix 同序，列主序）。
+// 供世界轴旋转（把世界旋转 premultiply 回 Euler）使用。
+static void BuildRotFromEuler(float rx, float ry, float rz, float R[16]) {
+    const float a = rx * 3.14159265f / 180.0f;
+    const float b = ry * 3.14159265f / 180.0f;
+    const float c = rz * 3.14159265f / 180.0f;
+    const float ca = std::cos(a), sa = std::sin(a);
+    const float cb = std::cos(b), sb = std::sin(b);
+    const float cc = std::cos(c), sc = std::sin(c);
+    const float Rx[16] = {1,0,0,0, 0,ca,sa,0, 0,-sa,ca,0, 0,0,0,1};
+    const float Ry[16] = {cb,0,-sb,0, 0,1,0,0, sb,0,cb,0, 0,0,0,1};
+    const float Rz[16] = {cc,sc,0,0, -sc,cc,0,0, 0,0,1,0, 0,0,0,1};
+    float tmp[16];
+    MatMul4(Ry, Rx, tmp);
+    MatMul4(Rz, tmp, R);          // R = Rz·Ry·Rx（列主序）
+}
+// Round355：绕世界轴（0=X/1=Y/2=Z）旋转 deg 度的世界旋转矩阵（premultiply 到现有旋转 = 世界空间旋转）
+static void MakeWorldRot(int axis, float deg, float R[16]) {
+    const float r = deg * 3.14159265f / 180.0f;
+    const float c = std::cos(r), s = std::sin(r);
+    float m[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    if (axis == 0) {        // 绕世界 X
+        m[5] = c; m[6] = s; m[9] = -s; m[10] = c;
+    } else if (axis == 1) { // 绕世界 Y
+        m[0] = c; m[2] = -s; m[8] = s; m[10] = c;
+    } else {                 // 绕世界 Z
+        m[0] = c; m[1] = s; m[4] = -s; m[5] = c;
+    }
+    for (int i = 0; i < 16; ++i) R[i] = m[i];
+}
+// Round355：由 R=Rz·Ry·Rx（与 BuildRotFromEuler 同序）反解本地欧拉角 rx/ry/rz（度）。
+// 列主序 R 的元素：R[2]=-sin(ry)，R[0]=cos(ry)cos(rz)，R[1]=cos(ry)sin(rz)，R[6]=cos(ry)sin(rx)，R[10]=cos(ry)cos(rx)
+static void EulerFromR(const float R[16], float& rx, float& ry, float& rz) {
+    const float sy = -R[2];                                   // R[2] = -sin(ry)
+    float ryv = std::asin(std::max(-1.0f, std::min(1.0f, sy)));
+    const float cy = std::cos(ryv);
+    if (cy > 1e-6f) {
+        rz = std::atan2(R[1], R[0]) * 180.0f / 3.14159265f;   // atan2(sin(rz),cos(rz))
+        rx = std::atan2(R[6], R[10]) * 180.0f / 3.14159265f;  // atan2(sin(rx),cos(rx))
+    } else {                                                  // 万向锁（ry≈±90°）：固定 rz=0，由残余解 rx
+        rz = 0.0f;
+        rx = std::atan2(R[4], R[5]) * 180.0f / 3.14159265f;
+    }
+    ry = ryv * 180.0f / 3.14159265f;
+}
+
 // Round296：旋转选中物体（绕世界轴，deg 为度数；记录撤销）。axis: 'X'/'Y'/'Z'
 void RotateSelectedObject(App& app, char axis, float deg) {
     if (app.selectedObject < 0 || app.selectedObject >= static_cast<int>(app.objects.size())) return;
@@ -734,7 +780,7 @@ static int PickGizmoAxisAt(App& app, float mx, float my) {
     MatMul4(proj, view, mvp);
     VkViewport vv{static_cast<float>(vp.offset.x), static_cast<float>(vp.offset.y),
                   static_cast<float>(vp.extent.width), static_cast<float>(vp.extent.height), 0.0f, 1.0f};
-    const float dirs[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+    const float dirs[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};   // Round355：世界轴（gizmo 固定不随物体旋转）
     float best = 1e30f;
     int bestAxis = -1;
     for (int i = 0; i < 3; ++i) {
@@ -809,6 +855,27 @@ static void GizmoFillVert(VertexSolid& vv, const float* pos, const float* col) {
     vv.color[0] = col[0]; vv.color[1] = col[1]; vv.color[2] = col[2]; vv.color[3] = 1.0f;
 }
 
+// Round354：给定轴方向 d，求两个与其垂直的单位基向量 u/w（用于锥头截面圆）
+static void GizmoPerpBasis(const float d[3], float u[3], float w[3]) {
+    float rx = 0.0f, ry = 1.0f, rz = 0.0f;          // 参考向量（优先 Y，与 d 近平行时改 X）
+    if (std::fabs(d[1]) >= 0.9f) { rx = 1.0f; ry = 0.0f; rz = 0.0f; }
+    u[0] = ry * d[2] - rz * d[1];
+    u[1] = rz * d[0] - rx * d[2];
+    u[2] = rx * d[1] - ry * d[0];
+    float lu = std::sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+    if (lu < 1e-6f) { u[0] = 1.0f; u[1] = 0.0f; u[2] = 0.0f; } else { u[0] /= lu; u[1] /= lu; u[2] /= lu; }
+    w[0] = d[1] * u[2] - d[2] * u[1];
+    w[1] = d[2] * u[0] - d[0] * u[2];
+    w[2] = d[0] * u[1] - d[1] * u[0];
+    float lw = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+    if (lw < 1e-6f) { w[0] = 0.0f; w[1] = 1.0f; w[2] = 0.0f; } else { w[0] /= lw; w[1] /= lw; w[2] /= lw; }
+}
+
+// Round354：前向声明（定义见下方 DrawRotate 之后）——DrawMoveGizmo 在其前使用，避免顺序问题
+static void GizmoFillCone(const float* tip, const float* base, float rad,
+                          const float* u, const float* w,
+                          VertexSolid* v, int& vi, int n, const float* col);
+
 // 创建并绑定 HOST 可见顶点缓冲（惰性：首次创建复用；Round302：容量不足时销毁重建，
 // 因旋转/缩放 gizmo 与移动三向标共用缓冲且顶点数不同）
 static bool EnsureHostVtxBuffer(App& app, VkBuffer& buf, VkDeviceMemory& mem, VkDeviceSize size) {
@@ -843,95 +910,51 @@ static bool EnsureHostVtxBuffer(App& app, VkBuffer& buf, VkDeviceMemory& mem, Vk
 // 绘制移动三向标（Round244：锥头**实体填充、完全不透明**）：3 条彩色轴箭头（X 红 / Y 绿 / Z 蓝），
 // 无深度测试**渲染于最顶层始终可见**；轴长按相机距离保持恒定屏幕尺寸（Round245）；拖动中高亮被选轴。
 // 顶点写世界坐标（含平移），用 mvp 投影
+// Round354：移动三向标——外观统一为缩放 gizmo 样式（3 轴 + 锥头 + 中心方块），
+// 且改用物体本地坐标轴（ax，跟随物体朝向）；中心方块 = 自由拖拽入口（gizmoDragMode==3）。
+// 与缩放 gizmo 共用 kUserRed/Green/Blue 配色，外观一致。
 static void DrawMoveGizmo(App& app, const float mvp[16], const VkRect2D& vp) {
     if (app.selectedObject < 0 || app.selectedObject >= static_cast<int>(app.objects.size())) return;
     if (app.pipelineLine3dNoDepth == VK_NULL_HANDLE || app.pipelineGizmoSolid == VK_NULL_HANDLE) return;
     const SceneObject& o = app.objects[app.selectedObject];
     float p[3];
     GizmoPivot(o, p);
-    const float len = GizmoAxisLen(app, p, vp);
-    const float dirs[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
-    const float cols[3][3] = {
-        {0.95f, 0.30f, 0.30f},   // X 红
-        {0.30f, 0.95f, 0.40f},   // Y 绿
-        {0.35f, 0.55f, 1.00f},   // Z 蓝
-    };
-    // 相机右/上基向量（锥头朝向观察者，避免轴与视线共线时看不见）
-    float view[16];
-    app.camera.ViewMatrix(view);
-    const float rightV[3] = {view[0], view[4], view[8]};
-    const float upV[3]    = {view[1], view[5], view[9]};
-    const float kTwoPi = 6.2831853f;
-    const VkViewport gvp{static_cast<float>(vp.offset.x), static_cast<float>(vp.offset.y),
-                         static_cast<float>(vp.extent.width), static_cast<float>(vp.extent.height), 0.0f, 1.0f};
+    const float len = GizmoAxisLen(app, p, vp) * 0.72f;
+    const float dirs[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};   // Round355：世界轴（gizmo 固定不随物体旋转）
 
-    // Round308：轴悬停高亮——未拖拽时检测鼠标命中哪根轴（PickGizmoAxisAt 返回 0/1/2）
-    const int hoverAxis = (!app.gizmoDragging) ? PickGizmoAxisAt(app, app.mouseX, app.mouseY) : -1;
-
-    // 每轴颜色（拖动中/悬停提亮）
-    float axCol[3][4];
-    for (int i = 0; i < 3; ++i) {
-        const bool active = (app.gizmoDragging && app.gizmoAxis == i) ||
-                            (!app.gizmoDragging && hoverAxis == i);
-        float cr = cols[i][0], cg = cols[i][1], cb = cols[i][2];
-        if (active) { cr = std::min(1.0f, cr * 1.5f + 0.2f); cg = std::min(1.0f, cg * 1.5f + 0.2f); cb = std::min(1.0f, cb * 1.5f + 0.2f); }
-        axCol[i][0] = cr; axCol[i][1] = cg; axCol[i][2] = cb; axCol[i][3] = 1.0f;
-    }
-
-    // ---- 线框部分：中心环 20 段×2 + 三轴主线 2×3 = 46 顶点 ----
-    constexpr int kRingSegs = 20;
-    constexpr int kLineVerts = kRingSegs * 2 + 3 * 2;   // 46
+    // Round354：本地轴配色（与缩放 gizmo 的 kUserRed/Green/Blue 一致；该常量定义在下方，此处本地定义避免顺序问题）
+    static const float kMvRed[3]   = {0.765f, 0.055f, 0.137f};
+    static const float kMvGreen[3] = {0.137f, 0.675f, 0.224f};
+    static const float kMvBlue[3]  = {0.114f, 0.125f, 0.533f};
+    const float cols[3][3] = {{kMvRed[0], kMvRed[1], kMvRed[2]},
+                              {kMvGreen[0], kMvGreen[1], kMvGreen[2]},
+                              {kMvBlue[0], kMvBlue[1], kMvBlue[2]}};
+    const bool dragging = (app.gizmoDragging && app.gizmoDragMode == 1);
+    const int hover = (!dragging) ? PickGizmoAxisAt(app, app.mouseX, app.mouseY) : -1;
+    // ---- 线框：3 条轴主线（p → 锥底）----
+    constexpr int kLineVerts = 3 * 2;
     if (!EnsureHostVtxBuffer(app, app.gizmoVtxBuffer, app.gizmoVtxMem, kLineVerts * 40)) return;
     {
         void* mapped = nullptr;
         if (vkMapMemory(app.device, app.gizmoVtxMem, 0, kLineVerts * 40, 0, &mapped) != VK_SUCCESS) return;
         VertexSolid* v = static_cast<VertexSolid*>(mapped);
         int vi = 0;
-        // 中心环（浅灰，面向观察者）；悬停（鼠标距枢轴投影 <16px）或拖拽中 → 提亮（Round265）
-        const float ringR = len * 0.22f;
-        bool ringHover = (app.gizmoDragging && app.gizmoDragMode == 3);
-        if (!ringHover) {
-            float sx, sy;
-            const VkViewport hv{static_cast<float>(vp.offset.x), static_cast<float>(vp.offset.y),
-                                static_cast<float>(vp.extent.width), static_cast<float>(vp.extent.height), 0.0f, 1.0f};
-            if (ProjectToViewport(mvp, hv, p[0], p[1], p[2], sx, sy)) {
-                const float ddx = app.mouseX - sx, ddy = app.mouseY - sy;
-                ringHover = (ddx * ddx + ddy * ddy) <= 24.0f * 24.0f;   // Round265/274：与命中容差一致 24px
-            }
-        }
-        float ringCol[4] = {0.72f, 0.72f, 0.72f, 1.0f};
-        if (ringHover) { ringCol[0] = 1.0f; ringCol[1] = 1.0f; ringCol[2] = 0.85f; ringCol[3] = 1.0f; }
-        for (int k = 0; k < kRingSegs; ++k) {
-            const float a0 = static_cast<float>(k) / kRingSegs * kTwoPi;
-            const float a1 = static_cast<float>(k + 1) / kRingSegs * kTwoPi;
-            float pa[3], pb[3];
-            for (int c = 0; c < 3; ++c) {
-                pa[c] = p[c] + (std::cos(a0) * rightV[c] + std::sin(a0) * upV[c]) * ringR;
-                pb[c] = p[c] + (std::cos(a1) * rightV[c] + std::sin(a1) * upV[c]) * ringR;
-            }
-            GizmoFillVert(v[vi++], pa, ringCol);
-            GizmoFillVert(v[vi++], pb, ringCol);
-        }
-        // 三轴主线
         for (int i = 0; i < 3; ++i) {
-            const float* dir = dirs[i];
-            const float tip[3] = {p[0] + dir[0] * len, p[1] + dir[1] * len, p[2] + dir[2] * len};
-            GizmoFillVert(v[vi++], p, axCol[i]);
-            GizmoFillVert(v[vi++], tip, axCol[i]);
+            const bool active = (dragging && app.gizmoAxis == i) || (!dragging && hover == i);
+            float col[4] = {cols[i][0], cols[i][1], cols[i][2], 1.0f};
+            if (active) for (int c = 0; c < 3; ++c) col[c] = std::min(1.0f, col[c] * 1.5f + 0.2f);
+            const float tip[3] = {p[0] + dirs[i][0] * len * 0.82f,
+                                  p[1] + dirs[i][1] * len * 0.82f,
+                                  p[2] + dirs[i][2] * len * 0.82f};
+            GizmoFillVert(v[vi++], p, col);
+            GizmoFillVert(v[vi++], tip, col);
         }
         vkUnmapMemory(app.device, app.gizmoVtxMem);
     }
-    vkCmdSetViewport(app.commandBuffer, 0, 1, &gvp);
-    vkCmdSetScissor(app.commandBuffer, 0, 1, &vp);
-    vkCmdBindPipeline(app.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.pipelineLine3dNoDepth);
-    VkDeviceSize off = 0;
-    vkCmdBindVertexBuffers(app.commandBuffer, 0, 1, &app.gizmoVtxBuffer, &off);
-    vkCmdPushConstants(app.commandBuffer, app.pipelineLayoutLine3d,
-                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64, mvp);
-    vkCmdDraw(app.commandBuffer, kLineVerts, 1, 0, 0);
-
-    // ---- 实体锥头：每轴 12 个三角形（侧面 6 + 底面 6）×3 顶点 = 108 ----
-    constexpr int kSolidVerts = 3 * 12 * 3;   // 108
+    // ---- 实体：3 锥头 + 中心方块 ----
+    constexpr int kConeVerts = 12 * 6;
+    constexpr int kCubeVerts = 12 * 3;
+    constexpr int kSolidVerts = kConeVerts * 3 + kCubeVerts;
     if (!EnsureHostVtxBuffer(app, app.gizmoSolidVtxBuffer, app.gizmoSolidVtxMem, kSolidVerts * 40)) return;
     {
         void* mapped = nullptr;
@@ -939,57 +962,58 @@ static void DrawMoveGizmo(App& app, const float mvp[16], const VkRect2D& vp) {
         VertexSolid* v = static_cast<VertexSolid*>(mapped);
         int vi = 0;
         for (int i = 0; i < 3; ++i) {
-            const float* dir = dirs[i];
-            const float tip[3] = {p[0] + dir[0] * len, p[1] + dir[1] * len, p[2] + dir[2] * len};
-            // 与轴垂直的两个基向量（相机右/上去掉轴分量）
-            float perp1[3], perp2[3];
-            const float rDot = rightV[0] * dir[0] + rightV[1] * dir[1] + rightV[2] * dir[2];
-            const float uDot = upV[0]    * dir[0] + upV[1]    * dir[1] + upV[2]    * dir[2];
-            perp1[0] = rightV[0] - dir[0] * rDot; perp1[1] = rightV[1] - dir[1] * rDot; perp1[2] = rightV[2] - dir[2] * rDot;
-            perp2[0] = upV[0]    - dir[0] * uDot; perp2[1] = upV[1]    - dir[1] * uDot; perp2[2] = upV[2]    - dir[2] * uDot;
-            const float l1 = std::sqrt(perp1[0] * perp1[0] + perp1[1] * perp1[1] + perp1[2] * perp1[2]);
-            const float l2 = std::sqrt(perp2[0] * perp2[0] + perp2[1] * perp2[1] + perp2[2] * perp2[2]);
-            if (l1 > 1e-6f) { perp1[0] /= l1; perp1[1] /= l1; perp1[2] /= l1; }
-            else            { perp1[0] = 1.0f; perp1[1] = 0.0f; perp1[2] = 0.0f; }
-            if (l2 > 1e-6f) { perp2[0] /= l2; perp2[1] /= l2; perp2[2] /= l2; }
-            else            { perp2[0] = 0.0f; perp2[1] = 1.0f; perp2[2] = 0.0f; }
-            // 锥头：底心在尖端回缩 coneLen，底半径 coneRad，6 边
-            const float coneLen = len * 0.30f;
-            const float coneRad = len * 0.16f;
-            const float baseC[3] = {tip[0] - dir[0] * coneLen, tip[1] - dir[1] * coneLen, tip[2] - dir[2] * coneLen};
-            float base[6][3];
-            for (int k = 0; k < 6; ++k) {
-                const float ang = static_cast<float>(k) / 6.0f * kTwoPi;
-                base[k][0] = baseC[0] + (std::cos(ang) * perp1[0] + std::sin(ang) * perp2[0]) * coneRad;
-                base[k][1] = baseC[1] + (std::cos(ang) * perp1[1] + std::sin(ang) * perp2[1]) * coneRad;
-                base[k][2] = baseC[2] + (std::cos(ang) * perp1[2] + std::sin(ang) * perp2[2]) * coneRad;
-            }
-            const float* c = axCol[i];
-            const float capC[4] = {c[0] * 0.72f, c[1] * 0.72f, c[2] * 0.72f, 1.0f};  // 底面稍暗，立体感
-            // 侧面 6 三角
-            for (int k = 0; k < 6; ++k) {
-                GizmoFillVert(v[vi++], tip, c);
-                GizmoFillVert(v[vi++], base[k], c);
-                GizmoFillVert(v[vi++], base[(k + 1) % 6], c);
-            }
-            // 底面 6 三角（封口）
-            for (int k = 0; k < 6; ++k) {
-                GizmoFillVert(v[vi++], baseC, capC);
-                GizmoFillVert(v[vi++], base[k], capC);
-                GizmoFillVert(v[vi++], base[(k + 1) % 6], capC);
-            }
+            const bool active = (dragging && app.gizmoAxis == i) || (!dragging && hover == i);
+            float col[4] = {cols[i][0], cols[i][1], cols[i][2], 1.0f};
+            if (active) for (int c = 0; c < 3; ++c) col[c] = std::min(1.0f, col[c] * 1.5f + 0.2f);
+            const float tip[3] = {p[0] + dirs[i][0] * len,
+                                  p[1] + dirs[i][1] * len,
+                                  p[2] + dirs[i][2] * len};
+            const float base[3] = {p[0] + dirs[i][0] * len * 0.82f,
+                                   p[1] + dirs[i][1] * len * 0.82f,
+                                   p[2] + dirs[i][2] * len * 0.82f};
+            float perpU[3], perpW[3];
+            GizmoPerpBasis(dirs[i], perpU, perpW);   // Round354：本地轴垂直基（任意朝向正确截面）
+            GizmoFillCone(tip, base, len * 0.05f, perpU, perpW, v, vi, 12, col);
+        }
+        const float hs = len * 0.085f;   // 中心方块（自由拖拽把手）
+        bool centerHit = (app.gizmoDragging && app.gizmoDragMode == 3);
+        if (!centerHit) centerHit = HitGizmoRingAt(app, app.mouseX, app.mouseY);
+        float cb[4] = {0.96f, 0.96f, 1.0f, 1.0f};
+        if (centerHit) for (int c = 0; c < 3; ++c) cb[c] = 1.0f;
+        const float c0[3] = {p[0] - hs, p[1] - hs, p[2] - hs};
+        const float c1[3] = {p[0] + hs, p[1] + hs, p[2] + hs};
+        const float cn[8][3] = {
+            {c0[0], c0[1], c0[2]}, {c1[0], c0[1], c0[2]}, {c1[0], c1[1], c0[2]}, {c0[0], c1[1], c0[2]},
+            {c0[0], c0[1], c1[2]}, {c1[0], c0[1], c1[2]}, {c1[0], c1[1], c1[2]}, {c0[0], c1[1], c1[2]},
+        };
+        const int faces[6][4] = {{0,1,2,3},{5,4,7,6},{0,4,5,1},{1,5,6,2},{2,6,7,3},{3,7,4,0}};
+        for (int f = 0; f < 6; ++f) {
+            const float* a = cn[faces[f][0]];
+            const float* b = cn[faces[f][1]];
+            const float* cc = cn[faces[f][2]];
+            const float* d = cn[faces[f][3]];
+            GizmoFillVert(v[vi++], a, cb); GizmoFillVert(v[vi++], b, cb); GizmoFillVert(v[vi++], cc, cb);
+            GizmoFillVert(v[vi++], a, cb); GizmoFillVert(v[vi++], cc, cb); GizmoFillVert(v[vi++], d, cb);
         }
         vkUnmapMemory(app.device, app.gizmoSolidVtxMem);
     }
+    const VkViewport gvp{static_cast<float>(vp.offset.x), static_cast<float>(vp.offset.y),
+                         static_cast<float>(vp.extent.width), static_cast<float>(vp.extent.height), 0.0f, 1.0f};
     vkCmdSetViewport(app.commandBuffer, 0, 1, &gvp);
     vkCmdSetScissor(app.commandBuffer, 0, 1, &vp);
+    VkDeviceSize off = 0;
+    vkCmdBindPipeline(app.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.pipelineLine3dNoDepth);
+    vkCmdBindVertexBuffers(app.commandBuffer, 0, 1, &app.gizmoVtxBuffer, &off);
+    vkCmdPushConstants(app.commandBuffer, app.pipelineLayoutLine3d,
+                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64, mvp);
+    vkCmdDraw(app.commandBuffer, kLineVerts, 1, 0, 0);
     vkCmdBindPipeline(app.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.pipelineGizmoSolid);
-    off = 0;
     vkCmdBindVertexBuffers(app.commandBuffer, 0, 1, &app.gizmoSolidVtxBuffer, &off);
     vkCmdPushConstants(app.commandBuffer, app.pipelineLayoutLine3d,
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64, mvp);
     vkCmdDraw(app.commandBuffer, kSolidVerts, 1, 0, 0);
 }
+
 
 // ==================== Round298：旋转/缩放 gizmo（Blender 式：3 模式不同样式） ====================
 
@@ -1073,8 +1097,8 @@ static void DrawRotateGizmo(App& app, const float mvp[16], const VkRect2D& vp) {
     GizmoPivot(o, p);
     const float len = GizmoAxisLen(app, p, vp);
     const float r = len * 0.78f;
-    // 三轴环正交基：0=X 环(YZ) 红 / 1=Y 环(XZ) 绿 / 2=Z 环(XY) 蓝
-    const float basis[3][2][3] = {
+    // Round355：世界轴环基（gizmo 固定不随物体旋转）：0=X 环(YZ) 红 / 1=Y 环(XZ) 绿 / 2=Z 环(XY) 蓝
+    float basis[3][2][3] = {
         {{0, 1, 0}, {0, 0, 1}},
         {{1, 0, 0}, {0, 0, 1}},
         {{1, 0, 0}, {0, 1, 0}},
@@ -1168,12 +1192,11 @@ static void DrawScaleGizmo(App& app, const float mvp[16], const VkRect2D& vp) {
     float p[3];
     GizmoPivot(o, p);
     const float len = GizmoAxisLen(app, p, vp) * 0.72f;
-    const float dirs[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+    const float dirs[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};   // Round355：世界轴（gizmo 固定不随物体旋转）
+
     const float cols[3][3] = {{kUserRed[0], kUserRed[1], kUserRed[2]},
                               {kUserGreen[0], kUserGreen[1], kUserGreen[2]},
                               {kUserBlue[0], kUserBlue[1], kUserBlue[2]}};
-    const float baseU[3][3] = {{0, 1, 0}, {1, 0, 0}, {1, 0, 0}};   // 锥底面正交基
-    const float baseW[3][3] = {{0, 0, 1}, {0, 0, 1}, {0, 1, 0}};
     const bool dragging = (app.gizmoDragging && app.gizmoDragMode == 5);
     // Round307：Blender 式悬停高亮——未拖拽时按鼠标位置检测命中轴/锥头/中心方块（3=中心）
     const int hover = (!dragging) ? PickScaleGizmoAt(app, app.mouseX, app.mouseY) : -1;
@@ -1217,7 +1240,9 @@ static void DrawScaleGizmo(App& app, const float mvp[16], const VkRect2D& vp) {
             const float base[3] = {p[0] + dirs[i][0] * len * 0.82f,
                                    p[1] + dirs[i][1] * len * 0.82f,
                                    p[2] + dirs[i][2] * len * 0.82f};
-            GizmoFillCone(tip, base, len * 0.05f, baseU[i], baseW[i], v, vi, 12, col);
+            float perpU[3], perpW[3];
+            GizmoPerpBasis(dirs[i], perpU, perpW);   // Round354：本地轴垂直基（任意朝向正确截面）
+            GizmoFillCone(tip, base, len * 0.05f, perpU, perpW, v, vi, 12, col);
         }
         const float hs = len * 0.085f;   // 中心方块（Round307：放大，等比把手）
         float cb[4] = {0.96f, 0.96f, 1.0f, 1.0f};
@@ -1274,7 +1299,8 @@ static int PickRotateGizmoAt(App& app, float mx, float my) {
     if (vp.extent.width <= 0 || vp.extent.height <= 0) return -1;
     const float len = GizmoAxisLen(app, p, vp);
     const float r = len * 0.78f;
-    const float basis[3][2][3] = {
+    // Round355：世界轴环基（gizmo 固定不随物体旋转）：与 DrawRotateGizmo 一致
+    float basis[3][2][3] = {
         {{0, 1, 0}, {0, 0, 1}},
         {{1, 0, 0}, {0, 0, 1}},
         {{1, 0, 0}, {0, 1, 0}},
@@ -1343,7 +1369,7 @@ static int PickScaleGizmoAt(App& app, float mx, float my) {
     const VkRect2D& vp = lay.viewport;
     if (vp.extent.width <= 0 || vp.extent.height <= 0) return -1;
     const float len = GizmoAxisLen(app, p, vp) * 0.72f;
-    const float dirs[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+    const float dirs[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};   // Round355：世界轴（gizmo 固定不随物体旋转）
     float view[16], proj[16], mvp[16];
     app.camera.ViewMatrix(view);
     const float aspect = static_cast<float>(vp.extent.width) / static_cast<float>(vp.extent.height);
@@ -1752,7 +1778,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         app->gizmoDragging = true;
                         app->gizmoStartTx = so.tx; app->gizmoStartTy = so.ty; app->gizmoStartTz = so.tz;
                         GizmoPivot(so, app->gizmoPivot);
-                        const float dirs[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+                        const float dirs[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};   // Round355：世界轴（gizmo 固定不随物体旋转）
                         float o[3], d[3];
                         float t = 0.0f;
                         if (BuildViewRay(*app, mx, my, o, d)) ClosestAxisParam(app->gizmoPivot, dirs[axis], o, d, t);
@@ -1983,9 +2009,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 app->selectedObject >= 0 &&
                 app->selectedObject < static_cast<int>(app->objects.size())) {
                 SceneObject& so = app->objects[app->selectedObject];
-                if (app->gizmoAxis == -2) {   // Round307：中心轴点 trackball——水平拖绕 Y、垂直拖绕 X
-                    so.ry += dx * 0.35f;
-                    so.rx += dy * 0.35f;
+                if (app->gizmoAxis == -2) {   // Round307/355：中心 trackball——水平拖绕世界Y、垂直拖绕世界X（世界空间，朝向不影响方向）
+                    float R0[16], Ry[16], Rx[16], R1[16], Rnew[16];
+                    BuildRotFromEuler(app->gizmoStartRx, app->gizmoStartRy, app->gizmoStartRz, R0);
+                    MakeWorldRot(1, -dx * 0.35f, Ry);
+                    MakeWorldRot(0, -dy * 0.35f, Rx);
+                    MatMul4(Ry, R0, R1);
+                    MatMul4(Rx, R1, Rnew);
+                    EulerFromR(Rnew, so.rx, so.ry, so.rz);
                     if (dx * dx + dy * dy > 4.0f) app->mouseDragged = true;
                 } else {
                     const float a0 = std::atan2(app->pressY - app->gizmoScreenPivotY,
@@ -1995,9 +2026,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     float dTheta = (a1 - a0) * 180.0f / 3.14159265f;
                     while (dTheta > 180.0f) dTheta -= 360.0f;
                     while (dTheta < -180.0f) dTheta += 360.0f;
-                    if (app->gizmoAxis == 0) so.rx = app->gizmoStartRx - dTheta;
-                    else if (app->gizmoAxis == 1) so.ry = app->gizmoStartRy - dTheta;
-                    else so.rz = app->gizmoStartRz - dTheta;
+                    // Round355：世界空间旋转——绕世界轴 premultiply，gizmo 固定不随物体旋转，朝向不影响拖拽方向
+                    float R0[16], Rw[16], Rnew[16];
+                    BuildRotFromEuler(app->gizmoStartRx, app->gizmoStartRy, app->gizmoStartRz, R0);
+                    MakeWorldRot(app->gizmoAxis, -dTheta, Rw);
+                    MatMul4(Rw, R0, Rnew);
+                    EulerFromR(Rnew, so.rx, so.ry, so.rz);
                     if (dTheta * dTheta > 4.0f) app->mouseDragged = true;
                 }
                 app->camera.lastX = x;
@@ -2027,7 +2061,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                          static_cast<float>(vp.extent.height), 0.0f, 1.0f};
                     float gp[3];
                     GizmoPivot(so, gp);
-                    const float dirs[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+                    const float dirs[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};   // Round355：世界轴（gizmo 固定不随物体旋转）
                     const float tip[3] = {gp[0] + dirs[axis][0], gp[1] + dirs[axis][1],
                                           gp[2] + dirs[axis][2]};
                     float sx0, sy0, sx1, sy1;
@@ -2084,13 +2118,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (app->gizmoDragging && app->gizmoAxis >= 0 &&
                 app->selectedObject >= 0 &&
                 app->selectedObject < static_cast<int>(app->objects.size())) {
-                const float dirs[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+                SceneObject& so = app->objects[app->selectedObject];
+                const float dirs[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};   // Round355：世界轴（gizmo 固定不随物体旋转）
                 const float* dir = dirs[app->gizmoAxis];
                 float o[3], d[3];
                 float t = app->gizmoStartT;
                 if (BuildViewRay(*app, x, y, o, d)) ClosestAxisParam(app->gizmoPivot, dir, o, d, t);
                 const float delta = t - app->gizmoStartT;
-                SceneObject& so = app->objects[app->selectedObject];
                 so.tx = app->gizmoStartTx + dir[0] * delta;
                 so.ty = app->gizmoStartTy + dir[1] * delta;
                 so.tz = app->gizmoStartTz + dir[2] * delta;
@@ -2688,10 +2722,11 @@ bool CreateVertexBuffer3D(App& app) {
     // 未算过 AABB 的物体先算（选中拾取用；导入/复制后自动维护）
     for (auto& o : app.objects)
         if (o.boundsMin[0] > 1e29f) ComputeObjectBounds(o);
-    // Round269：线框模式（Blender 边框）需要唯一边数据——wireVerts 为空时自动构建
+    // Round353：wireVerts 已由导入器按原始面生成（四边）。仅当 wireVerts 与 featureVerts 都空（如纯线物体）才用 solid 补建，
+    // 否则会清掉已生成的四边 wireVerts（MC 合并网格尤其不能触发，否则对角线又回来）。
     for (auto& o : app.objects)
-        if ((o.wireVerts.empty() || o.featureVerts.empty()) && !o.solidIndices.empty())
-            BuildObjectWireframe(o);   // Round309：旧模型首次补建特征边
+        if (!o.solidIndices.empty() && o.wireVerts.empty() && o.featureVerts.empty())
+            BuildObjectWireframe(o);
     uint64_t totalVerts = 0, totalIndices = 0, totalWireVerts = 0;
     for (auto& o : app.objects) {
         const uint32_t wv = static_cast<uint32_t>(o.wireVerts.size());
@@ -4978,7 +5013,7 @@ static void UploadLabelRgba(App& app, App::LabelTexture& lt,
 // 条上方居中显示当前距离数值（七段数码，窄字 + 明显字间距）
 static void DrawScaleBar(App& app, const Layout& layout) {
     // Round328：淡入淡出动画（navZoomAlpha 驱动）——默认隐藏；滚轮缩放 0.1s 淡入、
-    // 停止 0.5s 淡出、与万向球 0.1s 互相替换（UpdateNavHud 精确时间规则）
+    // 停止 0.5s 淡出、与罗盘/距离条 0.1s 互斥替换（UpdateNavHud 精确时间规则）
     if (app.navZoomAlpha <= 0.004f) return;
     const float za = app.navZoomAlpha;
     const VkRect2D& vp = layout.viewport;
@@ -5049,6 +5084,54 @@ static void DrawScaleBar(App& app, const Layout& layout) {
                                  {static_cast<uint32_t>(wTxt), static_cast<uint32_t>(hTxt)}};
             VkClearColorValue col{{markCol.float32[0], markCol.float32[1], markCol.float32[2], za}};
             DrawIcon(app, tRect, col, app.scaleLabel.set);
+        }
+    }
+}
+
+// 摄像机坐标显示（Round345）：平移时左下角显示 X/Y/Z 三行坐标（3 位精度）。
+// Round347：显示相机注视点 target（而非 eye position）——turntable 旋转/缩放都保持 target 固定，
+// 只有平移(pan) 才改变它，故旋转视角时坐标不变；由 navCoordAlpha 淡入淡出（目标点变化→淡入，静止 0.5s 淡出）。
+static void DrawCoordHud(App& app, const Layout& layout) {
+    if (app.navCoordAlpha <= 0.004f) return;
+    const float ca = app.navCoordAlpha;
+    const VkRect2D& vp = layout.viewport;
+    if (vp.extent.width <= 0 || vp.extent.height <= 0) return;
+    const Vec3 p = app.camera.target;   // Round347：注视点（旋转/缩放不变，仅平移变）
+
+    // 全屏视口（DrawIcon 依赖当前视口把像素坐标映射到屏幕）
+    VkViewport viewport{0.0f, 0.0f, static_cast<float>(app.swapchainExtent.width),
+                        static_cast<float>(app.swapchainExtent.height), 0.0f, 1.0f};
+    vkCmdSetViewport(app.commandBuffer, 0, 1, &viewport);
+
+    const float margin = 16.0f;
+    const float baseY = static_cast<float>(vp.offset.y + vp.extent.height) - margin;
+    const float x0 = static_cast<float>(vp.offset.x) + margin + 4.0f;
+    const float lineH = 18.0f;
+    const char* axes[3] = {"X", "Y", "Z"};
+    const float vals[3] = {p.x, p.y, p.z};
+
+    for (int i = 0; i < 3; ++i) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%s: %.3f", axes[i], vals[i]);
+        wchar_t wbuf[64];
+        MultiByteToWideChar(CP_UTF8, 0, buf, -1, wbuf, 64);
+        if (app.coordLabels[i].text != wbuf) {
+            std::vector<uint8_t> rgba;
+            int tw = 0, th = 0;
+            if (RasterizeText(wbuf, 13, 2, L"Segoe UI", rgba, tw, th)) {
+                UploadLabelRgba(app, app.coordLabels[i], rgba, tw, th);
+                app.coordLabels[i].text = wbuf;
+            }
+        }
+        if (app.coordLabels[i].set != VK_NULL_HANDLE) {
+            const float wTxt = static_cast<float>(app.coordLabels[i].w);
+            const float hTxt = static_cast<float>(app.coordLabels[i].h);
+            const float lx = x0;
+            const float ly = baseY - 24.0f - (2 - i) * lineH;   // Round352：整体下移 20px（X 最上、Z 最下）
+            const VkRect2D tRect{{static_cast<int32_t>(lx), static_cast<int32_t>(ly)},
+                                 {static_cast<uint32_t>(wTxt), static_cast<uint32_t>(hTxt)}};
+            VkClearColorValue col{{0.90f * ca, 0.90f * ca, 0.92f * ca, ca}};
+            DrawIcon(app, tRect, col, app.coordLabels[i].set);
         }
     }
 }
@@ -5277,6 +5360,16 @@ static void UpdateObjectLabels(App& app) {
     if (nowMs - app.objLabelThrottleMs < 100) return;         // 节流
     app.objLabelThrottleMs = nowMs;
     constexpr int kListW = static_cast<int>(kSideBarWidth) - 2 * kObjPanelPad;   // 面板内宽
+
+    // Round346：删除最后一个（或全部）模型后 names 为空，RasterizeNameList 因 h<=0 返回 false，
+    // 若不显式清空，旧列表（最后一个模型名）会残留不消失。此处直接清空标签。
+    if (names.empty()) {
+        app.objNameLabel.w = 0;
+        app.objNameLabel.h = 0;
+        app.objNameLabel.text = key;   // 记录已处理，避免下一帧反复重试
+        return;
+    }
+
     std::vector<uint8_t> rgba;
     int w = 0, h = 0;
     if (!RasterizeNameList(names, kListW, kObjPanelRowH, rgba, w, h)) return;
@@ -5284,11 +5377,10 @@ static void UpdateObjectLabels(App& app) {
     app.objNameLabel.text = key;
 }
 
-// ============================ Round310：左下角导航万向球 ============================
-// 状态机：orbit → 万向球出现；zoom → 缩放距离显示出现；停止操作 0.5s 淡出；
-// 被另一个替换时 0.1s 淡入/淡出。
+// ============================ 缩放距离条 + 摄像机坐标 淡入淡出 ============================
+// 距离条：zoom 动作 → 淡入；静止 0.5s 淡出（Round323 精确时间规则）。
+// 摄像机坐标：平移(pan)移动时满显；停止后静待 1 秒再淡出（Round349）。旋转/缩放不改变 target 故不影响。
 static void UpdateNavHud(App& app) {
-    // Round323：精确时间规则——淡入 0.1s、被替换淡出 0.1s、无动作停止淡出 0.5s
     static uint64_t s_lastFrameMs = 0;
     const uint64_t now = GetTickCount64();
     const float dt = s_lastFrameMs ? std::min(0.05f, static_cast<float>(now - s_lastFrameMs) / 1000.0f)
@@ -5296,164 +5388,35 @@ static void UpdateNavHud(App& app) {
     s_lastFrameMs = now;
     const float sinceMs = static_cast<float>(now - app.navLastActionMs);
     const bool active = sinceMs < 500.0f;                    // 0.5s 无动作 → 开始淡出
-    const int wantSphere = (active && app.navLastActionType == 1) ? 1 : 0;
-    const int wantZoom   = (active && app.navLastActionType == 2) ? 1 : 0;
+    const int wantZoom = (active && app.navLastActionType == 2) ? 1 : 0;
     const float inRate  = 1.0f / 0.1f;   // 出现 0.1s
-    const float swapOut = 1.0f / 0.1f;   // 被替换 0.1s 淡出
     const float stopOut = 1.0f / 0.5f;   // 无动作 0.5s 淡出
-    if (wantSphere) {
-        app.navSphereAlpha = std::min(1.0f, app.navSphereAlpha + dt * inRate);
-    } else {
-        app.navSphereAlpha = std::max(0.0f, app.navSphereAlpha - dt * ((wantZoom == 1) ? swapOut : stopOut));
-    }
     if (wantZoom) {
         app.navZoomAlpha = std::min(1.0f, app.navZoomAlpha + dt * inRate);
     } else {
-        app.navZoomAlpha = std::max(0.0f, app.navZoomAlpha - dt * ((wantSphere == 1) ? swapOut : stopOut));
+        app.navZoomAlpha = std::max(0.0f, app.navZoomAlpha - dt * stopOut);
     }
-}
-
-// 万向球：左下角，球轮廓 + 随视野旋转的三色轴 + 比球略大的上下分界线圆网格（坐标轴管线 pipelineAxis）
-static void DrawNavHud(App& app, const float camView[16], const Layout& layout) {
-    const VkRect2D& vp = layout.viewport;
-    if (vp.extent.width <= 0 || vp.extent.height <= 0) return;
-    if (app.pipelineAxis == VK_NULL_HANDLE) return;
-    const float vpW = static_cast<float>(vp.extent.width);
-    const float vpH = static_cast<float>(vp.extent.height);
-    const float R = std::max(26.0f, vpH * 0.05f);           // 万向球半径
-    const float margin = 16.0f;
-    // Round320：万向球改回左下角原位置（Round310 原始布局）
-    const float cx = static_cast<float>(vp.offset.x) + margin + R;
-    const float baseCy = static_cast<float>(vp.offset.y) + vpH - margin - R;
-    const float cy = baseCy;
-    const float halfSize = R + 20.0f;                        // 容纳球上方的小箭头
-    const VkRect2D gRect{{static_cast<int32_t>(cx - halfSize), static_cast<int32_t>(cy - halfSize)},
-                         {static_cast<uint32_t>(halfSize * 2.0f), static_cast<uint32_t>(halfSize * 2.0f)}};
-    const VkViewport gViewport{cx - halfSize, cy - halfSize, halfSize * 2.0f, halfSize * 2.0f, 0.0f, 1.0f};
-    float gOrtho[16];
-    OrthoMatrix(halfSize, gOrtho);
-    // 世界轴方向随视野旋转（viewRot = view 的旋转部分）
-    float viewRot[16] = {};
-    viewRot[0] = camView[0]; viewRot[4] = camView[4]; viewRot[8]  = camView[8];
-    viewRot[1] = camView[1]; viewRot[5] = camView[5]; viewRot[9]  = camView[9];
-    viewRot[2] = camView[2]; viewRot[6] = camView[6]; viewRot[10] = camView[10];
-    viewRot[15] = 1.0f;
-    float gizmoMvp[16];
-    MatMul4(gOrtho, viewRot, gizmoMvp);
-    vkCmdSetViewport(app.commandBuffer, 0, 1, &gViewport);
-    vkCmdSetScissor(app.commandBuffer, 0, 1, &gRect);
-    vkCmdBindPipeline(app.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.pipelineAxis);
-    const float sa = app.navSphereAlpha;
-    if (sa > 0.004f) {
-        const float vw = vpW, vh = vpH;
-        const float kTwoPi = 6.2831853f;
-        auto drawSeg = [&](const float* mvpm, float ax, float ay, float az,
-                           float bx, float by, float bz, float r, float g, float b, float lineW) {
-            Axis3DPush p{};
-            std::memcpy(p.mvp, mvpm, 64);
-            p.pointA[0] = ax; p.pointA[1] = ay; p.pointA[2] = az; p.pointA[3] = 1.0f;
-            p.pointB[0] = bx; p.pointB[1] = by; p.pointB[2] = bz; p.pointB[3] = 1.0f;
-            p.params[0] = lineW; p.params[1] = vw; p.params[2] = vh;
-            p.color[0] = r * sa; p.color[1] = g * sa; p.color[2] = b * sa; p.color[3] = sa;
-            vkCmdPushConstants(app.commandBuffer, app.pipelineLayoutAxis,
-                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                               0, sizeof(Axis3DPush), &p);
-            vkCmdDraw(app.commandBuffer, 4, 1, 0, 0);
-        };
-        // Round321：实体球面（真正 3D 球模型，淡蓝 + Lambert 明暗着色 → 立体球面）
-        if (app.pipelineGizmoSolid != VK_NULL_HANDLE) {
-            constexpr int kSphereVerts = 8 * 6 * 6;   // 8 环 × 6 高 = 288 顶点
-            if (EnsureHostVtxBuffer(app, app.gizmoSolidVtxBuffer, app.gizmoSolidVtxMem, kSphereVerts * 40)) {
-                void* mapped = nullptr;
-                if (vkMapMemory(app.device, app.gizmoSolidVtxMem, 0, kSphereVerts * 40, 0, &mapped) == VK_SUCCESS) {
-                    VertexSolid* sv = static_cast<VertexSolid*>(mapped);
-                    int vi = 0;
-                    const float base[3] = {0.18f, 0.32f, 0.58f};   // 深蓝球面（Round328：实体更"实"，亮经纬线对比 → 3d 感）
-                    auto fillV = [&](VertexSolid& vv, float nx, float ny, float nz) {
-                        vv.pos[0] = nx * R; vv.pos[1] = ny * R; vv.pos[2] = nz * R;
-                        vv.normal[0] = nx; vv.normal[1] = ny; vv.normal[2] = nz;
-                        vv.color[0] = base[0] * sa; vv.color[1] = base[1] * sa;
-                        vv.color[2] = base[2] * sa; vv.color[3] = sa;
-                    };
-                    for (int iy = 0; iy < 6; ++iy) {
-                        const float a0 = static_cast<float>(iy) / 6 * 3.14159265f;
-                        const float a1 = static_cast<float>(iy + 1) / 6 * 3.14159265f;
-                        for (int ix = 0; ix < 8; ++ix) {
-                            const float b0 = static_cast<float>(ix) / 8 * kTwoPi;
-                            const float b1 = static_cast<float>(ix + 1) / 8 * kTwoPi;
-                            const float p[4][3] = {
-                                {std::sin(a0) * std::cos(b0), std::cos(a0), std::sin(a0) * std::sin(b0)},
-                                {std::sin(a0) * std::cos(b1), std::cos(a0), std::sin(a0) * std::sin(b1)},
-                                {std::sin(a1) * std::cos(b1), std::cos(a1), std::sin(a1) * std::sin(b1)},
-                                {std::sin(a1) * std::cos(b0), std::cos(a1), std::sin(a1) * std::sin(b0)},
-                            };
-                            fillV(sv[vi++], p[0][0], p[0][1], p[0][2]);
-                            fillV(sv[vi++], p[1][0], p[1][1], p[1][2]);
-                            fillV(sv[vi++], p[2][0], p[2][1], p[2][2]);
-                            fillV(sv[vi++], p[0][0], p[0][1], p[0][2]);
-                            fillV(sv[vi++], p[2][0], p[2][1], p[2][2]);
-                            fillV(sv[vi++], p[3][0], p[3][1], p[3][2]);
-                        }
-                    }
-                    vkUnmapMemory(app.device, app.gizmoSolidVtxMem);
-                }
-                vkCmdBindPipeline(app.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.pipelineGizmoSolid);
-                VkDeviceSize off = 0;
-                vkCmdBindVertexBuffers(app.commandBuffer, 0, 1, &app.gizmoSolidVtxBuffer, &off);
-                vkCmdPushConstants(app.commandBuffer, app.pipelineLayoutLine3d,
-                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64, gOrtho);
-                vkCmdDraw(app.commandBuffer, kSphereVerts, 1, 0, 0);
-                vkCmdBindPipeline(app.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.pipelineAxis);   // 恢复
-            }
+    // 摄像机坐标（Round347）：检测注视点 target 位移——旋转(orbit)/缩放(zoom) 都保持 target 固定，
+    // 只有平移(pan) 才改它；故旋转视角时坐标不变，仅平移时淡入。
+    const Vec3& cp = app.camera.target;
+    const float dpos = std::sqrt((cp.x - app.navCoordPrevPos.x) * (cp.x - app.navCoordPrevPos.x)
+                               + (cp.y - app.navCoordPrevPos.y) * (cp.y - app.navCoordPrevPos.y)
+                               + (cp.z - app.navCoordPrevPos.z) * (cp.z - app.navCoordPrevPos.z));
+    app.navCoordPrevPos = cp;
+    if (dpos > 0.001f) {
+        // 平移中：满显，并刷新"最后移动时刻"
+        app.navCoordAlpha = 1.0f;
+        app.navCoordStopMs = now;
+    } else {
+        // Round351：停止平移后先静待 0.5 秒（保持满显），之后 1.0s 淡出。
+        const float sinceStop = static_cast<float>(now - app.navCoordStopMs);
+        if (sinceStop < 500.0f) {
+            app.navCoordAlpha = 1.0f;   // 静待 0.5 秒
+        } else {
+            constexpr float coordFadeOut = 1.0f / 1.0f;   // Round350：淡出用 1.0s（静待 0.5s + 淡出 1s）
+            app.navCoordAlpha = std::max(0.0f, app.navCoordAlpha - dt * coordFadeOut);
         }
-        // 三色轴（随视野旋转）
-        const float cols[3][3] = {{0.95f, 0.30f, 0.30f}, {0.30f, 0.95f, 0.40f}, {0.35f, 0.55f, 1.00f}};
-        const float axes[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
-        for (int i = 0; i < 3; ++i) {
-            drawSeg(gizmoMvp, 0, 0, 0,
-                    axes[i][0] * R, axes[i][1] * R, axes[i][2] * R,
-                    cols[i][0], cols[i][1], cols[i][2], 2.2f);   // Round326：三色轴加粗
-        }
-        // Round322：球面经纬线——附着于球体表面，纯淡蓝色（无明暗光照）
-        constexpr int kSegs = 24;
-        const float latCol[3] = {0.60f, 0.76f, 1.0f};   // 经纬线淡蓝白（无明暗，附着球面）
-        // 经线：绕 Y 轴的 6 条大圆（φ=0°,30°...150°），纬度 θ 从 -90°→+90°
-        for (int m = 0; m < 6; ++m) {
-            const float phi = static_cast<float>(m) * 3.14159265f / 6.0f;
-            const float cp = std::cos(phi), sp = std::sin(phi);
-            for (int k = 0; k < kSegs; ++k) {
-                const float t0 = static_cast<float>(k) / kSegs * 3.14159265f - 1.5707963f;
-                const float t1 = static_cast<float>(k + 1) / kSegs * 3.14159265f - 1.5707963f;
-                const float c0 = std::cos(t0), s0 = std::sin(t0);
-                const float c1 = std::cos(t1), s1 = std::sin(t1);
-                drawSeg(gizmoMvp, R * c0 * cp, R * s0, R * c0 * sp,
-                        R * c1 * cp, R * s1, R * c1 * sp,
-                        latCol[0], latCol[1], latCol[2], 2.0f);   // Round326：经纬线加粗增强 3d 感
-            }
-        }
-        // 纬线：纬度圈 θ=-60°,-30°,0°,30°,60°（含赤道），绕 Y 全圆
-        for (int m = 0; m < 5; ++m) {
-            const float th = (static_cast<float>(m) - 2.0f) * 3.14159265f / 6.0f;   // -60..+60°
-            const float cr = std::cos(th) * R, sy = std::sin(th) * R;
-            for (int k = 0; k < kSegs; ++k) {
-                const float a0 = static_cast<float>(k) / kSegs * kTwoPi;
-                const float a1 = static_cast<float>(k + 1) / kSegs * kTwoPi;
-                drawSeg(gizmoMvp, std::cos(a0) * cr, sy, std::sin(a0) * cr,
-                        std::cos(a1) * cr, sy, std::sin(a1) * cr,
-                        latCol[0], latCol[1], latCol[2], 2.0f);   // Round326：经纬线加粗增强 3d 感
-            }
-        }
-        // Round314：删除中部上下分界线小网格（按图重做纯经纬球 + 三色轴 + 方向箭头）
-        // 方向指示箭头——球体正下方外部，垂直朝上指向球底（屏幕固定 gOrtho，球转箭头不动）
-        const float aTip  = R + 2.0f;           // 箭头尖端（朝上，靠近球底）
-        const float aBase = R + 16.0f;          // 箭头杆底（屏幕下方更远）
-        const float aWing = R + 8.0f;           // V 形两翼 y（尖端下方张开）
-        drawSeg(gOrtho, 0, aBase, 0, 0, aTip, 0, 0.95f, 0.95f, 1.0f, 1.6f);            // 杆（下→上）
-        drawSeg(gOrtho, 0, aTip, 0, -3.0f, aWing, 0, 0.95f, 0.95f, 1.0f, 1.6f);         // 左翼
-        drawSeg(gOrtho, 0, aTip, 0, 3.0f, aWing, 0, 0.95f, 0.95f, 1.0f, 1.6f);          // 右翼
     }
-    // Round328：删除 AI 误建的"距离 12.8"文字（distLabel）——用户最早的"缩放距离条"是
-    // Round256 的 DrawScaleBar（左下角比例尺），淡入淡出动画已由 navZoomAlpha 驱动
 }
 
 void DrawLogicBar(App& app, const Layout& layout) {
@@ -5473,7 +5436,7 @@ void DrawLogicBar(App& app, const Layout& layout) {
     };
     addPanel(layout.top, kPanelColor, 0.0f);
     addPanel(layout.left, kPanelColor, kCornerRadius);
-    addPanel(layout.right, kPanelColor, kCornerRadius);
+    addPanel(layout.right, kPanelColor, 0.0f);   // Round346：右部模型栏无圆角
     addPanel({{0, static_cast<int32_t>(h - kLineWidth)}, {w, 1}},
              kBorderColor, 0.0f);
     for (uint32_t i = 0; i < panelCount; ++i) DrawPanel(app, panels[i]);
@@ -5668,7 +5631,7 @@ void DrawLogicBar(App& app, const Layout& layout) {
         vkCmdBindVertexBuffers(app.commandBuffer, 0, 1, &app.vertexBuffer, &off);
         DrawPanel(app, {{{px - kObjPanelPad, py - kObjPanelPad},
                          {static_cast<uint32_t>(pw + 2 * kObjPanelPad), static_cast<uint32_t>(ph)}},
-                        panelFill, 8.0f, whiteBorder, 1.0f});
+                        panelFill, 0.0f, whiteBorder, 1.0f});   // Round346：模型列表面板无圆角
         // 每行背景（Round258：列表风格——所有行颜色加深，选中行用主题选中色；文字 alpha 混合叠加）
         const VkClearColorValue rowBg = {{0.235f, 0.235f, 0.255f, 1.0f}};   // 比面板底色稍深
         const int nRows = static_cast<int>(app.objects.size());
@@ -5922,8 +5885,8 @@ void DrawFrame(App& app) {
             vkCmdDrawIndexed(app.commandBuffer, static_cast<uint32_t>(sel.wireIndices.size()), 1,
                              sel.wireIndexOffset, sel.wireVtxOffset, 0);
         } else {
-            // Round309：选中外框——优先特征边（Blender Freestyle 棱边/边界边），无特征边回退全线框，再回退 AABB
-            const std::vector<VertexSolid>& feat = sel.featureVerts.empty() ? sel.wireVerts : sel.featureVerts;
+            // Round353：选中黄边包边——优先物体全线框（wireVerts，贴合任意形状），无线框回退特征边，再回退 AABB
+            const std::vector<VertexSolid>& feat = !sel.wireVerts.empty() ? sel.wireVerts : sel.featureVerts;
             if (!feat.empty()) {
                 // 懒生成黄色外框顶点（本地坐标，用 BuildModelMatrix 投影；物体变换无需重建，
                 // 切换选中/重新导入（名称变化）/容量不足才重建）
@@ -5985,58 +5948,63 @@ void DrawFrame(App& app) {
                                    VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                    0, 64, mvpm);
                 vkCmdDraw(app.commandBuffer, static_cast<uint32_t>(feat.size()), 1, 0, 0);
-            } else {
-                // 回退：黄色 AABB 线框（12 边，世界坐标，用 mvp 直接投影）
-                if (app.selVtxBuffer == VK_NULL_HANDLE) {
-                    const VkDeviceSize sz = 24 * 40;   // 24 顶点 × VertexSolid(40B)
-                    VkBufferCreateInfo bi{};
-                    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-                    bi.size = sz;
-                    bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
-                    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-                    vkCreateBuffer(app.device, &bi, nullptr, &app.selVtxBuffer);
-                    VkMemoryRequirements mr;
-                    vkGetBufferMemoryRequirements(app.device, app.selVtxBuffer, &mr);
-                    const uint32_t mi = FindMemoryType(app, mr.memoryTypeBits,
-                                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                    VkMemoryAllocateInfo ai{};
-                    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-                    ai.allocationSize = mr.size;
-                    ai.memoryTypeIndex = mi;
-                    vkAllocateMemory(app.device, &ai, nullptr, &app.selVtxMem);
-                    vkBindBufferMemory(app.device, app.selVtxBuffer, app.selVtxMem, 0);
-                }
-                void* p = nullptr;
-                if (vkMapMemory(app.device, app.selVtxMem, 0, 24 * 40, 0, &p) == VK_SUCCESS) {
-                    VertexSolid* v = static_cast<VertexSolid*>(p);
-                    const float minx = sel.boundsMin[0] + sel.tx, miny = sel.boundsMin[1] + sel.ty, minz = sel.boundsMin[2] + sel.tz;
-                    const float maxx = sel.boundsMax[0] + sel.tx, maxy = sel.boundsMax[1] + sel.ty, maxz = sel.boundsMax[2] + sel.tz;
-                    const float c[8][3] = {
-                        {minx, miny, minz}, {maxx, miny, minz}, {minx, maxy, minz}, {maxx, maxy, minz},
-                        {minx, miny, maxz}, {maxx, miny, maxz}, {minx, maxy, maxz}, {maxx, maxy, maxz},
-                    };
-                    const int edges[12][2] = {
-                        {0,1},{1,3},{3,2},{2,0}, {4,5},{5,7},{7,6},{6,4}, {0,4},{1,5},{3,7},{2,6},
-                    };
-                    for (int e = 0; e < 12; ++e) {
-                        for (int k = 0; k < 2; ++k) {
-                            VertexSolid& vv = v[e * 2 + k];
-                            const int idx = edges[e][k];
-                            vv.pos[0] = c[idx][0]; vv.pos[1] = c[idx][1]; vv.pos[2] = c[idx][2];
-                            vv.normal[0] = 0; vv.normal[1] = 1; vv.normal[2] = 0;
-                            vv.color[0] = 1.0f; vv.color[1] = 1.0f; vv.color[2] = 0.0f; vv.color[3] = 1.0f;
-                        }
-                    }
-                    vkUnmapMemory(app.device, app.selVtxMem);
-                }
-                vkCmdBindPipeline(app.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.pipelineLine3d);
-                VkDeviceSize off = 0;
-                vkCmdBindVertexBuffers(app.commandBuffer, 0, 1, &app.selVtxBuffer, &off);
-                vkCmdPushConstants(app.commandBuffer, app.pipelineLayoutLine3d,
-                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                                   0, 64, mvp);
-                vkCmdDraw(app.commandBuffer, 24, 1, 0, 0);
+        } else {
+            // 回退：黄色 AABB 线框（12 边）。本地 AABB × model（T·R·S）→ 跟随旋转/缩放（修选中框错位，Round353）
+            if (app.selVtxBuffer == VK_NULL_HANDLE) {
+                const VkDeviceSize sz = 24 * 40;   // 24 顶点 × VertexSolid(40B)
+                VkBufferCreateInfo bi{};
+                bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+                bi.size = sz;
+                bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+                bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+                vkCreateBuffer(app.device, &bi, nullptr, &app.selVtxBuffer);
+                VkMemoryRequirements mr;
+                vkGetBufferMemoryRequirements(app.device, app.selVtxBuffer, &mr);
+                const uint32_t mi = FindMemoryType(app, mr.memoryTypeBits,
+                                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                VkMemoryAllocateInfo ai{};
+                ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+                ai.allocationSize = mr.size;
+                ai.memoryTypeIndex = mi;
+                vkAllocateMemory(app.device, &ai, nullptr, &app.selVtxMem);
+                vkBindBufferMemory(app.device, app.selVtxBuffer, app.selVtxMem, 0);
             }
+            // 本地坐标 AABB 角点乘 model（含平移/旋转/缩放）→ 选中框跟随物体变换，不再停在原位
+            float model[16] = {};
+            BuildModelMatrix(sel, model);
+            float mvpm[16];
+            MatMul4(mvp, model, mvpm);
+            void* p = nullptr;
+            if (vkMapMemory(app.device, app.selVtxMem, 0, 24 * 40, 0, &p) == VK_SUCCESS) {
+                VertexSolid* v = static_cast<VertexSolid*>(p);
+                const float minx = sel.boundsMin[0], miny = sel.boundsMin[1], minz = sel.boundsMin[2];
+                const float maxx = sel.boundsMax[0], maxy = sel.boundsMax[1], maxz = sel.boundsMax[2];
+                const float c[8][3] = {
+                    {minx, miny, minz}, {maxx, miny, minz}, {minx, maxy, minz}, {maxx, maxy, minz},
+                    {minx, miny, maxz}, {maxx, miny, maxz}, {minx, maxy, maxz}, {maxx, maxy, maxz},
+                };
+                const int edges[12][2] = {
+                    {0,1},{1,3},{3,2},{2,0}, {4,5},{5,7},{7,6},{6,4}, {0,4},{1,5},{3,7},{2,6},
+                };
+                for (int e = 0; e < 12; ++e) {
+                    for (int k = 0; k < 2; ++k) {
+                        VertexSolid& vv = v[e * 2 + k];
+                        const int idx = edges[e][k];
+                        vv.pos[0] = c[idx][0]; vv.pos[1] = c[idx][1]; vv.pos[2] = c[idx][2];
+                        vv.normal[0] = 0; vv.normal[1] = 1; vv.normal[2] = 0;
+                        vv.color[0] = 1.0f; vv.color[1] = 1.0f; vv.color[2] = 0.0f; vv.color[3] = 1.0f;
+                    }
+                }
+                vkUnmapMemory(app.device, app.selVtxMem);
+            }
+            vkCmdBindPipeline(app.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.pipelineLine3d);
+            VkDeviceSize off = 0;
+            vkCmdBindVertexBuffers(app.commandBuffer, 0, 1, &app.selVtxBuffer, &off);
+            vkCmdPushConstants(app.commandBuffer, app.pipelineLayoutLine3d,
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, 64, mvpm);
+            vkCmdDraw(app.commandBuffer, 24, 1, 0, 0);
+        }
         }
     }
 
@@ -6283,9 +6251,9 @@ void DrawFrame(App& app) {
         vkCmdDraw(app.commandBuffer, 6, 1, 0, 0);
     }
 
-    g_stage = "DrawFrame:导航万向球";
+    g_stage = "DrawFrame:缩放距离条+坐标";
     UpdateNavHud(app);
-    DrawNavHud(app, camView, layout);
+    DrawCoordHud(app, layout);
 
     g_stage = "DrawFrame:逻辑栏/2D";
     DrawLogicBar(app, layout);
@@ -6468,8 +6436,10 @@ void Cleanup(App& app) {
         if (app.gizmoVtxMem != VK_NULL_HANDLE) vkFreeMemory(app.device, app.gizmoVtxMem, nullptr);
         if (app.gizmoSolidVtxBuffer != VK_NULL_HANDLE) vkDestroyBuffer(app.device, app.gizmoSolidVtxBuffer, nullptr);
         if (app.gizmoSolidVtxMem != VK_NULL_HANDLE) vkFreeMemory(app.device, app.gizmoSolidVtxMem, nullptr);
-        // 物体显示栏标签纹理（Round249）
-        for (App::LabelTexture* lt : {&app.objNameLabel}) {
+        // 物体显示栏标签纹理（Round249）+ 距离比例尺（Round310）
+        for (App::LabelTexture* lt : {&app.objNameLabel, &app.scaleLabel,
+                                       &app.coordLabels[0], &app.coordLabels[1],
+                                       &app.coordLabels[2]}) {
             if (lt->view) vkDestroyImageView(app.device, lt->view, nullptr);
             if (lt->image) vkDestroyImage(app.device, lt->image, nullptr);
             if (lt->memory) vkFreeMemory(app.device, lt->memory, nullptr);

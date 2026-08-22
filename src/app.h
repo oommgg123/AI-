@@ -252,10 +252,13 @@ struct App {
     };
     LabelTexture objNameLabel;   // 当前物体名称
     LabelTexture scaleLabel;     // 缩放条数值文字（Round331：系统默认字体 Segoe UI）
+    LabelTexture coordLabels[3] = {};   // 摄像机坐标 X/Y/Z 文字（Round345）
     uint64_t objLabelThrottleMs = 0;   // 标签重建节流（避免拖动时每帧上传纹理）
-    // Round310：左下角导航万向球 + 缩放距离显示（orbit→万向球出现，zoom→距离出现；停止 0.5s 淡出，切换 0.1s）
-    float navSphereAlpha = 0.0f;    // 万向球透明度（颜色调制）
+    // 缩放距离显示（zoom→距离条淡入；停止 0.5s 淡出）
     float navZoomAlpha = 0.0f;      // 缩放距离显示透明度
+    float navCoordAlpha = 0.0f;     // 摄像机坐标显示透明度（Round345，移动时淡入）
+    Vec3 navCoordPrevPos = {};      // 上一帧相机注视点（检测移动，Round345）
+    uint64_t navCoordStopMs = 0;    // 最后一次平移时刻（Round349：停止后静待 1s 再淡出）
     // Round332：中键框选（左键 = orbit 移动视角）
     bool marqueeSelecting = false;         // 框选进行中（中键拖动）
     float marqueeX0 = 0, marqueeY0 = 0;    // 框选起点（屏幕）

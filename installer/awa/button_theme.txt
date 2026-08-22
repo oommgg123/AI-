@@ -1,0 +1,14 @@
+# awa 按钮动画主题配置（明文，可手动编辑）
+# 颜色为 RGB 0~1 浮点，空格分隔；# 开头为注释
+# 状态说明：
+#   normal       = 默认色
+#   pressed      = 点击（按下）加深色
+#   released     = 松开加重色（比默认更深，表示已点击过）
+#   hover_border = 鼠标触碰（未点击）时边缘白条色
+#   anim_speed   = 颜色过渡速度（每帧 lerp 系数，0~1，越大过渡越快）
+
+normal    = 0.30 0.30 0.33
+pressed   = 0.16 0.16 0.18
+released  = 0.24 0.24 0.26
+hover_border = 1.00 1.00 1.00
+anim_speed = 0.25
