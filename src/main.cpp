@@ -2027,10 +2027,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     float dTheta = (a1 - a0) * 180.0f / 3.14159265f;
                     while (dTheta > 180.0f) dTheta -= 360.0f;
                     while (dTheta < -180.0f) dTheta += 360.0f;
+                    // Round357：旋转方向随视角修正——环法线朝向相机时屏幕角与右手旋转同向、背离时反向；
+                    // 固定符号会让背离相机的轴（默认即蓝轴 Z）旋转反向。s>=0 维持原 -dTheta，s<0 翻转。
+                    float view[16];
+                    app->camera.ViewMatrix(view);
+                    const float toViewer[3] = {view[2], view[6], view[10]};   // 场景→相机方向（世界）
+                    const float dirs3[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+                    const float s = dirs3[app->gizmoAxis][0] * toViewer[0]
+                                  + dirs3[app->gizmoAxis][1] * toViewer[1]
+                                  + dirs3[app->gizmoAxis][2] * toViewer[2];
+                    const float sign = (s >= 0.0f) ? 1.0f : -1.0f;
                     // Round355：世界空间旋转——绕世界轴 premultiply，gizmo 固定不随物体旋转，朝向不影响拖拽方向
                     float R0[16], Rw[16], Rnew[16];
                     BuildRotFromEuler(app->gizmoStartRx, app->gizmoStartRy, app->gizmoStartRz, R0);
-                    MakeWorldRot(app->gizmoAxis, -dTheta, Rw);
+                    MakeWorldRot(app->gizmoAxis, -dTheta * sign, Rw);
                     MatMul4(Rw, R0, Rnew);
                     EulerFromR(Rnew, so.rx, so.ry, so.rz);
                     if (dTheta * dTheta > 4.0f) app->mouseDragged = true;
