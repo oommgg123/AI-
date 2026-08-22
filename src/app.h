@@ -249,6 +249,13 @@ struct App {
     VkDeviceSize selVtxCapacity = 0;                   // Round306：黄线缓冲容量（不足时重建）
     int selVtxGenIndex = -1;                           // Round306：已生成黄线的物体索引
     std::wstring selVtxGenName;                        // Round306：已生成黄线的物体名（防 index 复用误用）
+    // Round359：选中外轮廓（视相关 silhouette）缓存——唯一边端点 + 至多 2 个邻接面法线（边界边 n1={0,0,0} 标记）
+    std::vector<uint32_t> selSilA;
+    std::vector<uint32_t> selSilB;
+    std::vector<float>    selSilN0;
+    std::vector<float>    selSilN1;
+    int selSilIndex = -1;
+    std::wstring selSilName;
     int selectedObject = -1;                            // 当前选中物体索引（-1=无）
     bool wireframeSel = false;                          // Tab：选中物体线框预览
     float pressX = 0.0f, pressY = 0.0f;                 // 左键按下位置（区分点击/拖拽）

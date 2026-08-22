@@ -1474,6 +1474,204 @@ static void BuildObjectWireframe(SceneObject& o) {
     }
 }
 
+// ==================== Round359：选中物体外轮廓描边（视相关 silhouette）====================
+
+// 为选中物体构建轮廓边缓存：solidIndices 每条唯一边 → 至多 2 个邻接三角形面法线（本地坐标）。
+// 边界边（只属于 1 个面）n1 记 {0,0,0} 标记 → 恒画；视相关判定由 DrawSelectionOutline 逐帧做。
+static void BuildSelSilhouette(const SceneObject& o, App& app) {
+    app.selSilA.clear(); app.selSilB.clear(); app.selSilN0.clear(); app.selSilN1.clear();
+    const auto& si = o.solidIndices;
+    const auto& sv = o.solidVerts;
+    if (si.size() < 3 || sv.empty()) return;
+    std::map<std::pair<uint32_t, uint32_t>, std::vector<uint32_t>> adj;
+    for (size_t k = 0; k + 2 < si.size(); k += 3) {
+        const uint32_t ia = si[k], ib = si[k + 1], ic = si[k + 2];
+        if (ia >= sv.size() || ib >= sv.size() || ic >= sv.size()) continue;
+        const uint32_t tri = static_cast<uint32_t>(k / 3);
+        const std::pair<uint32_t, uint32_t> keys[3] = {
+            {std::min(ia, ib), std::max(ia, ib)},
+            {std::min(ib, ic), std::max(ib, ic)},
+            {std::min(ic, ia), std::max(ic, ia)}};
+        for (int e = 0; e < 3; ++e) {
+            auto& lst = adj[keys[e]];
+            if (lst.size() < 2) lst.push_back(tri);
+        }
+    }
+    const auto triNormal = [&](uint32_t t, float n[3]) {
+        n[0] = n[1] = n[2] = 0.0f;
+        if (t * 3 + 2 >= si.size()) return;
+        const uint32_t ia = si[t * 3], ib = si[t * 3 + 1], ic = si[t * 3 + 2];
+        if (ia >= sv.size() || ib >= sv.size() || ic >= sv.size()) return;
+        const float* pa = sv[ia].pos; const float* pb = sv[ib].pos; const float* pc = sv[ic].pos;
+        const float u0 = pb[0] - pa[0], u1 = pb[1] - pa[1], u2 = pb[2] - pa[2];
+        const float w0 = pc[0] - pa[0], w1 = pc[1] - pa[1], w2 = pc[2] - pa[2];
+        n[0] = u1 * w2 - u2 * w1;
+        n[1] = u2 * w0 - u0 * w2;
+        n[2] = u0 * w1 - u1 * w0;
+        const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        if (len > 1e-9f) { n[0] /= len; n[1] /= len; n[2] /= len; }
+    };
+    app.selSilA.reserve(adj.size());
+    app.selSilB.reserve(adj.size());
+    app.selSilN0.reserve(adj.size() * 3);
+    app.selSilN1.reserve(adj.size() * 3);
+    for (const auto& kv : adj) {
+        const auto& tris = kv.second;
+        if (tris.empty()) continue;
+        app.selSilA.push_back(kv.first.first);
+        app.selSilB.push_back(kv.first.second);
+        float n0[3], n1[3];
+        triNormal(tris[0], n0);
+        if (tris.size() >= 2) triNormal(tris[1], n1);
+        else { n1[0] = n1[1] = n1[2] = 0.0f; }
+        for (int i = 0; i < 3; ++i) { app.selSilN0.push_back(n0[i]); app.selSilN1.push_back(n1[i]); }
+    }
+}
+
+// 绘制选中物体外轮廓——黄色 2px 线（深度 LEQUAL，线框模式下白线 pass 已跳过选中物体不会覆盖）。
+// 画法优先级：A=视相关 silhouette（正面/背面分界边 + 边界边）；轮廓边过多（>20 万）或无可计算数据时
+// 回退 B=静态棱边 featureVerts；C=索引线 wireIndices（importer 唯一点格式，修正 Round353 把唯一点当顶点对的 bug）；
+// D=顶点对 wireVerts（MC 合并网格）；全部为空 → E=AABB 黄框。
+static void DrawSelectionOutline(App& app, const SceneObject& sel, int selIndex, const float mvp[16]) {
+    if (app.pipelineLine3d == VK_NULL_HANDLE) return;
+    // 缓存失效重建（拓扑不变仅变换时无需重建）
+    if (app.selSilIndex != selIndex || app.selSilName != sel.name) {
+        BuildSelSilhouette(sel, app);
+        app.selSilIndex = selIndex;
+        app.selSilName = sel.name;
+    }
+    enum : int { kSil = 0, kFeature, kIndexed, kPairs, kAabb } mode = kSil;
+    const bool big = app.selSilA.size() > 200000;   // 大物体免逐帧判定（轮廓边过多）
+    if (app.selSilA.empty() || big) {
+        if (!sel.featureVerts.empty())      mode = kFeature;
+        else if (!sel.wireVerts.empty() && !sel.wireIndices.empty()) mode = kIndexed;
+        else if (!sel.wireVerts.empty())    mode = kPairs;
+        else                                mode = kAabb;
+    }
+    size_t maxVerts = 0;
+    switch (mode) {
+        case kSil:     maxVerts = app.selSilA.size() * 2; break;
+        case kFeature: maxVerts = sel.featureVerts.size(); break;
+        case kIndexed: maxVerts = sel.wireIndices.size(); break;
+        case kPairs:   maxVerts = sel.wireVerts.size(); break;
+        case kAabb:    maxVerts = 24; break;
+    }
+    if (maxVerts == 0) return;
+
+    // 确保顶点缓冲容量（复用 selVtxBuffer/selVtxMem/selVtxCapacity）
+    const VkDeviceSize need = static_cast<VkDeviceSize>(maxVerts) * 40;
+    if (app.selVtxBuffer != VK_NULL_HANDLE && app.selVtxCapacity < need) {
+        vkDestroyBuffer(app.device, app.selVtxBuffer, nullptr);
+        vkFreeMemory(app.device, app.selVtxMem, nullptr);
+        app.selVtxBuffer = VK_NULL_HANDLE;
+        app.selVtxMem = VK_NULL_HANDLE;
+        app.selVtxCapacity = 0;
+    }
+    if (app.selVtxBuffer == VK_NULL_HANDLE) {
+        VkBufferCreateInfo bi{};
+        bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bi.size = need;
+        bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+        bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        vkCreateBuffer(app.device, &bi, nullptr, &app.selVtxBuffer);
+        VkMemoryRequirements mr;
+        vkGetBufferMemoryRequirements(app.device, app.selVtxBuffer, &mr);
+        const uint32_t mi = FindMemoryType(app, mr.memoryTypeBits,
+                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        VkMemoryAllocateInfo ai{};
+        ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        ai.allocationSize = mr.size;
+        ai.memoryTypeIndex = mi;
+        vkAllocateMemory(app.device, &ai, nullptr, &app.selVtxMem);
+        vkBindBufferMemory(app.device, app.selVtxBuffer, app.selVtxMem, 0);
+        app.selVtxCapacity = need;
+    }
+
+    float model[16] = {};
+    BuildModelMatrix(sel, model);
+    void* p = nullptr;
+    if (vkMapMemory(app.device, app.selVtxMem, 0, need, 0, &p) != VK_SUCCESS) return;
+    VertexSolid* v = static_cast<VertexSolid*>(p);
+    size_t vi = 0;
+    if (mode == kSil) {
+        // 视相关轮廓：边中点→相机方向，两邻接面法线一正一负（或边界边）→ 轮廓
+        const float r00 = model[0], r01 = model[1], r02 = model[2], tx = model[12];
+        const float r10 = model[4], r11 = model[5], r12 = model[6], ty = model[13];
+        const float r20 = model[8], r21 = model[9], r22 = model[10], tz = model[14];
+        const auto& sv = sel.solidVerts;
+        const float cxp = app.camera.position.x, cyp = app.camera.position.y, czp = app.camera.position.z;
+        for (size_t i = 0; i < app.selSilA.size(); ++i) {
+            const uint32_t ia = app.selSilA[i], ib = app.selSilB[i];
+            if (ia >= sv.size() || ib >= sv.size()) continue;
+            const VertexSolid& va = sv[ia];
+            const VertexSolid& vb = sv[ib];
+            const float wax = r00 * va.pos[0] + r01 * va.pos[1] + r02 * va.pos[2] + tx;
+            const float way = r10 * va.pos[0] + r11 * va.pos[1] + r12 * va.pos[2] + ty;
+            const float waz = r20 * va.pos[0] + r21 * va.pos[1] + r22 * va.pos[2] + tz;
+            const float wbx = r00 * vb.pos[0] + r01 * vb.pos[1] + r02 * vb.pos[2] + tx;
+            const float wby = r10 * vb.pos[0] + r11 * vb.pos[1] + r12 * vb.pos[2] + ty;
+            const float wbz = r20 * vb.pos[0] + r21 * vb.pos[1] + r22 * vb.pos[2] + tz;
+            const float mdx = (wax + wbx) * 0.5f - cxp;
+            const float mdy = (way + wby) * 0.5f - cyp;
+            const float mdz = (waz + wbz) * 0.5f - czp;
+            const float inv = 1.0f / (std::sqrt(mdx * mdx + mdy * mdy + mdz * mdz) + 1e-9f);
+            const float cdx = mdx * inv, cdy = mdy * inv, cdz = mdz * inv;
+            const float n0x = app.selSilN0[i * 3], n0y = app.selSilN0[i * 3 + 1], n0z = app.selSilN0[i * 3 + 2];
+            const float n1x = app.selSilN1[i * 3], n1y = app.selSilN1[i * 3 + 1], n1z = app.selSilN1[i * 3 + 2];
+            bool draw;
+            if (n1x == 0.0f && n1y == 0.0f && n1z == 0.0f) {
+                draw = true;   // 边界边（开放网格外沿）恒画
+            } else {
+                const float d0 = (r00 * n0x + r01 * n0y + r02 * n0z) * cdx +
+                                 (r10 * n0x + r11 * n0y + r12 * n0z) * cdy +
+                                 (r20 * n0x + r21 * n0y + r22 * n0z) * cdz;
+                const float d1 = (r00 * n1x + r01 * n1y + r02 * n1z) * cdx +
+                                 (r10 * n1x + r11 * n1y + r12 * n1z) * cdy +
+                                 (r20 * n1x + r21 * n1y + r22 * n1z) * cdz;
+                draw = (d0 * d1 < 0.0f);   // 一正面一背面 → 轮廓边
+            }
+            if (draw) { v[vi++] = va; v[vi++] = vb; }
+        }
+    } else if (mode == kFeature) {
+        for (const auto& a : sel.featureVerts) v[vi++] = a;
+    } else if (mode == kIndexed) {
+        for (size_t i = 0; i + 1 < sel.wireIndices.size(); i += 2) {
+            const uint32_t a = sel.wireIndices[i], b = sel.wireIndices[i + 1];
+            if (a < sel.wireVerts.size() && b < sel.wireVerts.size()) { v[vi++] = sel.wireVerts[a]; v[vi++] = sel.wireVerts[b]; }
+        }
+    } else if (mode == kPairs) {
+        for (const auto& a : sel.wireVerts) v[vi++] = a;
+    } else {   // kAabb：黄色 AABB 12 边
+        const float minx = sel.boundsMin[0], miny = sel.boundsMin[1], minz = sel.boundsMin[2];
+        const float maxx = sel.boundsMax[0], maxy = sel.boundsMax[1], maxz = sel.boundsMax[2];
+        const float c[8][3] = {
+            {minx, miny, minz}, {maxx, miny, minz}, {minx, maxy, minz}, {maxx, maxy, minz},
+            {minx, miny, maxz}, {maxx, miny, maxz}, {minx, maxy, maxz}, {maxx, maxy, maxz}};
+        const int edges[12][2] = {{0,1},{1,3},{3,2},{2,0},{4,5},{5,7},{7,6},{6,4},{0,4},{1,5},{3,7},{2,6}};
+        for (int e = 0; e < 12; ++e) for (int k = 0; k < 2; ++k) {
+            VertexSolid& vv = v[vi++];
+            const int ci = edges[e][k];
+            vv.pos[0] = c[ci][0]; vv.pos[1] = c[ci][1]; vv.pos[2] = c[ci][2];
+        }
+    }
+    // 统一黄色 + 法线占位（line3d shader 只读 pos+color）
+    for (size_t i = 0; i < vi; ++i) {
+        v[i].normal[0] = 0.0f; v[i].normal[1] = 1.0f; v[i].normal[2] = 0.0f;
+        v[i].color[0] = 1.0f; v[i].color[1] = 0.84f; v[i].color[2] = 0.1f; v[i].color[3] = 1.0f;   // 黄
+    }
+    vkUnmapMemory(app.device, app.selVtxMem);
+
+    float mvpm[16];
+    MatMul4(mvp, model, mvpm);
+    VkPipeline pipe = (app.pipelineLine3dWide != VK_NULL_HANDLE) ? app.pipelineLine3dWide : app.pipelineLine3d;
+    vkCmdBindPipeline(app.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    VkDeviceSize off = 0;
+    vkCmdBindVertexBuffers(app.commandBuffer, 0, 1, &app.selVtxBuffer, &off);
+    vkCmdPushConstants(app.commandBuffer, app.pipelineLayoutLine3d,
+                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64, mvpm);
+    vkCmdDraw(app.commandBuffer, static_cast<uint32_t>(vi), 1, 0, 0);
+}
+
 // ==================== 撤销/重做（Round250：Ctrl+Z 撤销 / Ctrl+B 重做）====================
 
 void PushUndo(App& app, const App::UndoEntry& e) {
@@ -5952,127 +6150,10 @@ void DrawFrame(App& app) {
             vkCmdDrawIndexed(app.commandBuffer, static_cast<uint32_t>(sel.wireIndices.size()), 1,
                              sel.wireIndexOffset, sel.wireVtxOffset, 0);
         } else {
-            // Round353：选中黄边包边——优先物体全线框（wireVerts，贴合任意形状），无线框回退特征边，再回退 AABB
-            const std::vector<VertexSolid>& feat = !sel.wireVerts.empty() ? sel.wireVerts : sel.featureVerts;
-            if (!feat.empty()) {
-                // 懒生成黄色外框顶点（本地坐标，用 BuildModelMatrix 投影；物体变换无需重建，
-                // 切换选中/重新导入（名称变化）/容量不足才重建）
-                const VkDeviceSize need = static_cast<VkDeviceSize>(feat.size()) * 40;
-                const bool needRebuild = (app.selVtxBuffer == VK_NULL_HANDLE ||
-                                          app.selVtxCapacity < need ||
-                                          app.selVtxGenIndex != app.selectedObject ||
-                                          app.selVtxGenName != sel.name);
-                if (needRebuild) {
-                    if (app.selVtxBuffer != VK_NULL_HANDLE && app.selVtxCapacity < need) {
-                        vkDestroyBuffer(app.device, app.selVtxBuffer, nullptr);
-                        vkFreeMemory(app.device, app.selVtxMem, nullptr);
-                        app.selVtxBuffer = VK_NULL_HANDLE;
-                        app.selVtxMem = VK_NULL_HANDLE;
-                        app.selVtxCapacity = 0;
-                    }
-                    if (app.selVtxBuffer == VK_NULL_HANDLE) {
-                        VkBufferCreateInfo bi{};
-                        bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-                        bi.size = need;
-                        bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
-                        bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-                        vkCreateBuffer(app.device, &bi, nullptr, &app.selVtxBuffer);
-                        VkMemoryRequirements mr;
-                        vkGetBufferMemoryRequirements(app.device, app.selVtxBuffer, &mr);
-                        const uint32_t mi = FindMemoryType(app, mr.memoryTypeBits,
-                                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                        VkMemoryAllocateInfo ai{};
-                        ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-                        ai.allocationSize = mr.size;
-                        ai.memoryTypeIndex = mi;
-                        vkAllocateMemory(app.device, &ai, nullptr, &app.selVtxMem);
-                        vkBindBufferMemory(app.device, app.selVtxBuffer, app.selVtxMem, 0);
-                        app.selVtxCapacity = need;
-                    }
-                    void* p = nullptr;
-                    if (vkMapMemory(app.device, app.selVtxMem, 0, need, 0, &p) == VK_SUCCESS) {
-                        VertexSolid* v = static_cast<VertexSolid*>(p);
-                        for (size_t i = 0; i < feat.size(); ++i) {
-                            v[i].pos[0] = feat[i].pos[0];
-                            v[i].pos[1] = feat[i].pos[1];
-                            v[i].pos[2] = feat[i].pos[2];
-                            v[i].normal[0] = 0.0f; v[i].normal[1] = 1.0f; v[i].normal[2] = 0.0f;
-                            v[i].color[0] = 1.0f; v[i].color[1] = 0.84f; v[i].color[2] = 0.1f; v[i].color[3] = 1.0f;
-                        }
-                        vkUnmapMemory(app.device, app.selVtxMem);
-                    }
-                    app.selVtxGenIndex = app.selectedObject;
-                    app.selVtxGenName = sel.name;
-                }
-                float model[16] = {};
-                BuildModelMatrix(sel, model);
-                float mvpm[16];
-                MatMul4(mvp, model, mvpm);
-                vkCmdBindPipeline(app.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.pipelineLine3d);
-                VkDeviceSize off = 0;
-                vkCmdBindVertexBuffers(app.commandBuffer, 0, 1, &app.selVtxBuffer, &off);
-                vkCmdPushConstants(app.commandBuffer, app.pipelineLayoutLine3d,
-                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                                   0, 64, mvpm);
-                vkCmdDraw(app.commandBuffer, static_cast<uint32_t>(feat.size()), 1, 0, 0);
-        } else {
-            // 回退：黄色 AABB 线框（12 边）。本地 AABB × model（T·R·S）→ 跟随旋转/缩放（修选中框错位，Round353）
-            if (app.selVtxBuffer == VK_NULL_HANDLE) {
-                const VkDeviceSize sz = 24 * 40;   // 24 顶点 × VertexSolid(40B)
-                VkBufferCreateInfo bi{};
-                bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-                bi.size = sz;
-                bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
-                bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-                vkCreateBuffer(app.device, &bi, nullptr, &app.selVtxBuffer);
-                VkMemoryRequirements mr;
-                vkGetBufferMemoryRequirements(app.device, app.selVtxBuffer, &mr);
-                const uint32_t mi = FindMemoryType(app, mr.memoryTypeBits,
-                                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                VkMemoryAllocateInfo ai{};
-                ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-                ai.allocationSize = mr.size;
-                ai.memoryTypeIndex = mi;
-                vkAllocateMemory(app.device, &ai, nullptr, &app.selVtxMem);
-                vkBindBufferMemory(app.device, app.selVtxBuffer, app.selVtxMem, 0);
-            }
-            // 本地坐标 AABB 角点乘 model（含平移/旋转/缩放）→ 选中框跟随物体变换，不再停在原位
-            float model[16] = {};
-            BuildModelMatrix(sel, model);
-            float mvpm[16];
-            MatMul4(mvp, model, mvpm);
-            void* p = nullptr;
-            if (vkMapMemory(app.device, app.selVtxMem, 0, 24 * 40, 0, &p) == VK_SUCCESS) {
-                VertexSolid* v = static_cast<VertexSolid*>(p);
-                const float minx = sel.boundsMin[0], miny = sel.boundsMin[1], minz = sel.boundsMin[2];
-                const float maxx = sel.boundsMax[0], maxy = sel.boundsMax[1], maxz = sel.boundsMax[2];
-                const float c[8][3] = {
-                    {minx, miny, minz}, {maxx, miny, minz}, {minx, maxy, minz}, {maxx, maxy, minz},
-                    {minx, miny, maxz}, {maxx, miny, maxz}, {minx, maxy, maxz}, {maxx, maxy, maxz},
-                };
-                const int edges[12][2] = {
-                    {0,1},{1,3},{3,2},{2,0}, {4,5},{5,7},{7,6},{6,4}, {0,4},{1,5},{3,7},{2,6},
-                };
-                for (int e = 0; e < 12; ++e) {
-                    for (int k = 0; k < 2; ++k) {
-                        VertexSolid& vv = v[e * 2 + k];
-                        const int idx = edges[e][k];
-                        vv.pos[0] = c[idx][0]; vv.pos[1] = c[idx][1]; vv.pos[2] = c[idx][2];
-                        vv.normal[0] = 0; vv.normal[1] = 1; vv.normal[2] = 0;
-                        vv.color[0] = 1.0f; vv.color[1] = 1.0f; vv.color[2] = 0.0f; vv.color[3] = 1.0f;
-                    }
-                }
-                vkUnmapMemory(app.device, app.selVtxMem);
-            }
-            vkCmdBindPipeline(app.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.pipelineLine3d);
-            VkDeviceSize off = 0;
-            vkCmdBindVertexBuffers(app.commandBuffer, 0, 1, &app.selVtxBuffer, &off);
-            vkCmdPushConstants(app.commandBuffer, app.pipelineLayoutLine3d,
-                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                               0, 64, mvpm);
-            vkCmdDraw(app.commandBuffer, 24, 1, 0, 0);
-        }
-        }
+            // Round359：外轮廓描边——视相关 silhouette（正面/背面分界边 + 边界边），2px 黄线
+            // 替换 Round353「黄边包边」：旧实现把 importer 的唯一点 wireVerts 当顶点对非索引绘制 → 导入模型高亮乱线/不可见
+            DrawSelectionOutline(app, sel, app.selectedObject, mvp);
+    }
     }
 
     // Round329：多选高亮——其他框选物体画黄色 AABB 线框（世界坐标，直接乘 mvp）
@@ -6156,6 +6237,9 @@ void DrawFrame(App& app) {
         if (wirePipe == VK_NULL_HANDLE) wirePipe = app.pipelineLine3d;
         if (wirePipe != VK_NULL_HANDLE) {
             for (const auto& obj : app.objects) {
+                // Round359：选中物体跳过硬白线框——由黄色外轮廓高亮（避免白线覆盖）
+                if (app.selectedObject >= 0 &&
+                    &obj == &app.objects[static_cast<size_t>(app.selectedObject)]) continue;
                 const uint32_t wn = static_cast<uint32_t>(obj.wireIndices.size());
                 if (wn == 0) continue;
                 float model[16] = {};
