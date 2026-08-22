@@ -5728,27 +5728,23 @@ void DrawLogicBar(App& app, const Layout& layout) {
              kBorderColor, 0.0f);
     for (uint32_t i = 0; i < panelCount; ++i) DrawPanel(app, panels[i]);
 
-    // Round364：栏位「按下」才边缘高亮（非悬停）——按住左键且鼠标在栏位内 → 该栏位 2px 黄色亮边
+    // Round366：仅触碰（悬停）可拖拽窗口边缘才高亮——顶栏(div 0)不可拖不高亮；
+    // 悬停在左栏右缘/右栏左缘/底栏上缘（HitResizeDivider 返回 1/2/3）→ 该边缘画 2px 黄色亮线
     {
-        const float mx = app.mouseX, my = app.mouseY;
-        const auto inRect = [&](const VkRect2D& r) -> bool {
-            return mx >= static_cast<float>(r.offset.x) &&
-                   mx <  static_cast<float>(r.offset.x + static_cast<int32_t>(r.extent.width)) &&
-                   my >= static_cast<float>(r.offset.y) &&
-                   my <  static_cast<float>(r.offset.y + static_cast<int32_t>(r.extent.height));
-        };
-        if ((GetKeyState(VK_LBUTTON) & 0x8000) != 0) {   // 左键按住中
-            VkRect2D hr{};
-            float hrad = 0.0f;
-            if      (inRect(layout.top))    { hr = layout.top;    hrad = 0.0f; }
-            else if (inRect(layout.left))   { hr = layout.left;   hrad = kCornerRadius; }
-            else if (inRect(layout.right))  { hr = layout.right;  hrad = 0.0f; }
-            else if (inRect(layout.bottom)) { hr = layout.bottom; hrad = kCornerRadius; }
-            if (hr.extent.width > 0 && hr.extent.height > 0) {
-                const VkClearColorValue kYellow = {{1.0f, 0.84f, 0.1f, 1.0f}};
-                // 面板色填充（恢复底色）+ 2px 黄色描边 → 只显示边缘亮边
-                DrawPanel(app, {hr, kPanelColor, hrad, kYellow, 2.0f});
-            }
+        const int div = HitResizeDivider(app, app.mouseX, app.mouseY);
+        if (div >= 1) {
+            const VkClearColorValue kYellow = {{1.0f, 0.84f, 0.1f, 1.0f}};
+            const VkRect2D scissorAll{{0, 0}, {w, h}};
+            const float topY = static_cast<float>(layout.top.extent.height);
+            const float bottomY = static_cast<float>(layout.bottom.offset.y);
+            const float leftX = static_cast<float>(layout.left.extent.width);
+            const float rightX = static_cast<float>(layout.right.offset.x);
+            if (div == 1)
+                DrawLine(app, scissorAll, leftX - 1.0f, topY, leftX - 1.0f, bottomY, kYellow, 1.0f);   // 左栏右缘
+            else if (div == 2)
+                DrawLine(app, scissorAll, rightX, topY, rightX, bottomY, kYellow, 1.0f);              // 右栏左缘
+            else
+                DrawLine(app, scissorAll, 0.0f, bottomY, static_cast<float>(w), bottomY, kYellow, 1.0f);  // 底栏上缘
         }
     }
 
