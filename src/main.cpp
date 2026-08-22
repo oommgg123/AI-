@@ -201,10 +201,10 @@ void BuildModelMatrix(const SceneObject& o, float out[16]) {
     MatMul4(Ry, Rx, tmp);
     MatMul4(Rz, tmp, R);          // R = Rz·Ry·Rx
     const float S[16] = {o.sx,0,0,0, 0,o.sy,0,0, 0,0,o.sz,0, 0,0,0,1};
-    float SR[16];
-    MatMul4(S, R, SR);          // SR = S·R（Round304：缩放放旋转前 → 沿世界轴缩放，Blender Global 取向）
+    float RS[16];
+    MatMul4(R, S, RS);          // RS = R·S（Round356：缩放在旋转前 → 本地空间缩放，沿物体本地方向生效）
     const float T[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, o.tx,o.ty,o.tz,1};
-    MatMul4(T, SR, out);        // out = T·S·R（世界轴缩放，围绕物体原点）
+    MatMul4(T, RS, out);        // out = T·R·S（缩放本地化：先缩放后旋转，缩放随物体朝向改变）
 }
 
 // Round355：由本地欧拉角构造旋转矩阵 R=Rz·Ry·Rx（与 BuildModelMatrix 同序，列主序）。
@@ -1085,6 +1085,25 @@ static void GizmoFillCone(const float* tip, const float* base, float rad,
     }
 }
 
+// Round356：轴对齐小立方体（缩放手柄外观，替代锥头）；c 为中心，hs 为半边长
+static void GizmoFillCube(const float* c, float hs, VertexSolid* v, int& vi, const float* col) {
+    const float c0[3] = {c[0] - hs, c[1] - hs, c[2] - hs};
+    const float c1[3] = {c[0] + hs, c[1] + hs, c[2] + hs};
+    const float cn[8][3] = {
+        {c0[0], c0[1], c0[2]}, {c1[0], c0[1], c0[2]}, {c1[0], c1[1], c0[2]}, {c0[0], c1[1], c0[2]},
+        {c0[0], c0[1], c1[2]}, {c1[0], c0[1], c1[2]}, {c1[0], c1[1], c1[2]}, {c0[0], c1[1], c1[2]},
+    };
+    const int faces[6][4] = {{0,1,2,3},{5,4,7,6},{0,4,5,1},{1,5,6,2},{2,6,7,3},{3,7,4,0}};
+    for (int f = 0; f < 6; ++f) {
+        const float* a = cn[faces[f][0]];
+        const float* b = cn[faces[f][1]];
+        const float* cc = cn[faces[f][2]];
+        const float* d = cn[faces[f][3]];
+        GizmoFillVert(v[vi++], a, col); GizmoFillVert(v[vi++], b, col); GizmoFillVert(v[vi++], cc, col);
+        GizmoFillVert(v[vi++], a, col); GizmoFillVert(v[vi++], cc, col); GizmoFillVert(v[vi++], d, col);
+    }
+}
+
 // 旋转 gizmo（Blender 样式）：绕 X 轴（红轴）完整圆环 + 4 象限手柄球 + 中心轴点；
 // 拖拽中：弧线箭头显示累计旋转角度（从 0° 到当前角）
 // 旋转 gizmo（Blender 标准样式）：3 个彩色圆环（X红 Y绿 Z蓝，Blender 三环）+ 每环 4 象限手柄球 +
@@ -1200,7 +1219,7 @@ static void DrawScaleGizmo(App& app, const float mvp[16], const VkRect2D& vp) {
     const bool dragging = (app.gizmoDragging && app.gizmoDragMode == 5);
     // Round307：Blender 式悬停高亮——未拖拽时按鼠标位置检测命中轴/锥头/中心方块（3=中心）
     const int hover = (!dragging) ? PickScaleGizmoAt(app, app.mouseX, app.mouseY) : -1;
-    // ---- 线框：3 条轴主线（p → 锥底）----
+    // ---- 线框：3 条轴主线（p → 轴端立方体）----
     constexpr int kLineVerts = 3 * 2;
     if (!EnsureHostVtxBuffer(app, app.gizmoVtxBuffer, app.gizmoVtxMem, kLineVerts * 40)) return;
     {
@@ -1212,24 +1231,25 @@ static void DrawScaleGizmo(App& app, const float mvp[16], const VkRect2D& vp) {
             const bool active = (dragging && app.gizmoAxis == i) || (!dragging && hover == i);
             float col[4] = {cols[i][0], cols[i][1], cols[i][2], 1.0f};
             if (active) for (int c = 0; c < 3; ++c) col[c] = std::min(1.0f, col[c] * 1.5f + 0.2f);
-            const float tip[3] = {p[0] + dirs[i][0] * len * 0.82f,
-                                  p[1] + dirs[i][1] * len * 0.82f,
-                                  p[2] + dirs[i][2] * len * 0.82f};
+            const float tip[3] = {p[0] + dirs[i][0] * len,
+                                  p[1] + dirs[i][1] * len,
+                                  p[2] + dirs[i][2] * len};
             GizmoFillVert(v[vi++], p, col);
             GizmoFillVert(v[vi++], tip, col);
         }
         vkUnmapMemory(app.device, app.gizmoVtxMem);
     }
-    // ---- 实体：3 锥头 + 中心方块（Blender 缩放样式）----
-    constexpr int kConeVerts = 12 * 6;
-    constexpr int kCubeVerts = 12 * 3;
-    constexpr int kSolidVerts = kConeVerts * 3 + kCubeVerts;
+    // ---- 实体：3 个小立方体（轴端把手）+ 中心方块（Round356：缩放外观=小立方体，区别于移动锥头）----
+    constexpr int kEndCubeVerts = 12 * 3;
+    constexpr int kCenterCubeVerts = 12 * 3;
+    constexpr int kSolidVerts = kEndCubeVerts * 3 + kCenterCubeVerts;
     if (!EnsureHostVtxBuffer(app, app.gizmoSolidVtxBuffer, app.gizmoSolidVtxMem, kSolidVerts * 40)) return;
     {
         void* mapped = nullptr;
         if (vkMapMemory(app.device, app.gizmoSolidVtxMem, 0, kSolidVerts * 40, 0, &mapped) != VK_SUCCESS) return;
         VertexSolid* v = static_cast<VertexSolid*>(mapped);
         int vi = 0;
+        const float hs2 = len * 0.07f;   // 轴端小立方体半边长
         for (int i = 0; i < 3; ++i) {
             const bool active = (dragging && app.gizmoAxis == i) || (!dragging && hover == i);
             float col[4] = {cols[i][0], cols[i][1], cols[i][2], 1.0f};
@@ -1237,33 +1257,13 @@ static void DrawScaleGizmo(App& app, const float mvp[16], const VkRect2D& vp) {
             const float tip[3] = {p[0] + dirs[i][0] * len,
                                   p[1] + dirs[i][1] * len,
                                   p[2] + dirs[i][2] * len};
-            const float base[3] = {p[0] + dirs[i][0] * len * 0.82f,
-                                   p[1] + dirs[i][1] * len * 0.82f,
-                                   p[2] + dirs[i][2] * len * 0.82f};
-            float perpU[3], perpW[3];
-            GizmoPerpBasis(dirs[i], perpU, perpW);   // Round354：本地轴垂直基（任意朝向正确截面）
-            GizmoFillCone(tip, base, len * 0.05f, perpU, perpW, v, vi, 12, col);
+            GizmoFillCube(tip, hs2, v, vi, col);
         }
-        const float hs = len * 0.085f;   // 中心方块（Round307：放大，等比把手）
         float cb[4] = {0.96f, 0.96f, 1.0f, 1.0f};
         if ((dragging && app.gizmoAxis == 3) || (!dragging && hover == 3)) {   // 拖/悬停中心方块提亮
             for (int c = 0; c < 3; ++c) cb[c] = 1.0f;
         }
-        const float c0[3] = {p[0] - hs, p[1] - hs, p[2] - hs};
-        const float c1[3] = {p[0] + hs, p[1] + hs, p[2] + hs};
-        const float cn[8][3] = {
-            {c0[0], c0[1], c0[2]}, {c1[0], c0[1], c0[2]}, {c1[0], c1[1], c0[2]}, {c0[0], c1[1], c0[2]},
-            {c0[0], c0[1], c1[2]}, {c1[0], c0[1], c1[2]}, {c1[0], c1[1], c1[2]}, {c0[0], c1[1], c1[2]},
-        };
-        const int faces[6][4] = {{0,1,2,3},{5,4,7,6},{0,4,5,1},{1,5,6,2},{2,6,7,3},{3,7,4,0}};
-        for (int f = 0; f < 6; ++f) {
-            const float* a = cn[faces[f][0]];
-            const float* b = cn[faces[f][1]];
-            const float* cc = cn[faces[f][2]];
-            const float* d = cn[faces[f][3]];
-            GizmoFillVert(v[vi++], a, cb); GizmoFillVert(v[vi++], b, cb); GizmoFillVert(v[vi++], cc, cb);
-            GizmoFillVert(v[vi++], a, cb); GizmoFillVert(v[vi++], cc, cb); GizmoFillVert(v[vi++], d, cb);
-        }
+        GizmoFillCube(p, len * 0.085f, v, vi, cb);   // 中心方块（等比把手）
         vkUnmapMemory(app.device, app.gizmoSolidVtxMem);
     }
     const VkViewport gvp{static_cast<float>(vp.offset.x), static_cast<float>(vp.offset.y),
@@ -1314,7 +1314,7 @@ static int PickRotateGizmoAt(App& app, float mx, float my) {
                          static_cast<float>(vp.extent.width), static_cast<float>(vp.extent.height), 0.0f, 1.0f};
     constexpr int kSegs = 64;
     int hitRing = -1;
-    float hitDist = 16.0f * 16.0f;   // 命中阈值内取最近
+    float hitDist = 10.0f * 10.0f;   // Round356：旋转模式缩小轴（环）检测范围 16→10px
     for (int i = 0; i < 3; ++i) {   // 三环采样：返回距离最近者
         const float* u = basis[i][0];
         const float* w = basis[i][1];
@@ -1346,7 +1346,7 @@ static int PickRotateGizmoAt(App& app, float mx, float my) {
             float sx, sy;
             if (ProjectToViewport(mvp, gvp, c[0], c[1], c[2], sx, sy)) {
                 const float ddx = mx - sx, ddy = my - sy;
-                if (ddx * ddx + ddy * ddy < 18.0f * 18.0f) return i;
+                if (ddx * ddx + ddy * ddy < 12.0f * 12.0f) return i;   // Round356：手柄球检测 18→12px
             }
         }
     }
@@ -1387,9 +1387,10 @@ static int PickScaleGizmoAt(App& app, float mx, float my) {
     for (int i = 0; i < 3; ++i) {
         const float tip[3] = {p[0] + dirs[i][0] * len, p[1] + dirs[i][1] * len, p[2] + dirs[i][2] * len};
         float best = 1e9f;
-        constexpr int kSteps = 24;
+        // Round356：仅采样轴端外段 [0.55,1.0]（小立方体把手所在），与缩放外观对齐
+        constexpr int kSteps = 32;
         for (int k = 0; k <= kSteps; ++k) {
-            const float t = static_cast<float>(k) / kSteps;
+            const float t = 0.55f + 0.45f * static_cast<float>(k) / kSteps;
             float q[3];
             for (int c = 0; c < 3; ++c) q[c] = p[c] + (tip[c] - p[c]) * t;
             float sx, sy;
