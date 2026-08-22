@@ -597,8 +597,8 @@ Layout ComputeLayout(const App& app) {
     return l;
 }
 
-// Round362：命中可拖拽分隔线（0=顶栏下缘 1=左栏右缘 2=右栏左缘 3=底栏上缘；-1=无），整条线容差 ±6px
-// （Round360 曾改为拖拽图标命中，用户取消图标 → 恢复整线命中 + Windows 缩放光标）
+// Round364：命中可拖拽分隔线（1=左栏右缘 2=右栏左缘 3=底栏上缘；-1=无），整条线容差 ±6px。
+// 顶栏(0)已取消上下缩放（固定 36px）；编号与机制保留，以后别处可恢复。分割线随布局（ComputeLayout）动态伸缩。
 static int HitResizeDivider(const App& app, float mx, float my) {
     const Layout lay = ComputeLayout(app);
     constexpr float kTol = 6.0f;
@@ -606,12 +606,11 @@ static int HitResizeDivider(const App& app, float mx, float my) {
     const float bottomY = static_cast<float>(lay.bottom.offset.y);
     const float leftX   = static_cast<float>(lay.left.extent.width);
     const float rightX  = static_cast<float>(lay.right.offset.x);
-    if (std::fabs(my - topY) <= kTol) return 0;        // 顶栏下缘（全宽）
-    if (std::fabs(my - bottomY) <= kTol) return 3;     // 底栏上缘（全宽）
     if (my >= topY && my <= bottomY) {
         if (std::fabs(mx - leftX) <= kTol) return 1;   // 左栏右缘（垂直）
         if (std::fabs(mx - rightX) <= kTol) return 2;  // 右栏左缘（垂直）
     }
+    if (std::fabs(my - bottomY) <= kTol) return 3;     // 底栏上缘（全宽）
     return -1;
 }
 
@@ -2059,8 +2058,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (app->resizeDrag >= 0) {
                 app->resizeDrag = -1;
                 ReleaseCapture();
-                // Round360：拖拽结束 → 面板尺寸写入 awa_settings.txt（下次启动恢复）
-                SaveSettingInt("panel_top_h", static_cast<int>(app->panelTopH));
+                // Round364：拖拽结束 → 面板尺寸写入 awa_settings.txt（顶栏固定不保存；下次启动恢复左/右/底）
                 SaveSettingInt("panel_left_w", static_cast<int>(app->panelLeftW));
                 SaveSettingInt("panel_right_w", static_cast<int>(app->panelRightW));
                 SaveSettingInt("panel_bottom_h", static_cast<int>(app->panelBottomH));
@@ -5730,7 +5728,7 @@ void DrawLogicBar(App& app, const Layout& layout) {
              kBorderColor, 0.0f);
     for (uint32_t i = 0; i < panelCount; ++i) DrawPanel(app, panels[i]);
 
-    // Round363：鼠标移入栏位 → 该栏位高亮（覆盖面板底色，圆角随栏位；按钮/列表等内容随后绘制不受影响）
+    // Round364：栏位「按下」才边缘高亮（非悬停）——按住左键且鼠标在栏位内 → 该栏位 2px 黄色亮边
     {
         const float mx = app.mouseX, my = app.mouseY;
         const auto inRect = [&](const VkRect2D& r) -> bool {
@@ -5739,16 +5737,18 @@ void DrawLogicBar(App& app, const Layout& layout) {
                    my >= static_cast<float>(r.offset.y) &&
                    my <  static_cast<float>(r.offset.y + static_cast<int32_t>(r.extent.height));
         };
-        VkRect2D hr{};
-        float hrad = 0.0f;
-        if      (inRect(layout.top))    { hr = layout.top;    hrad = 0.0f; }
-        else if (inRect(layout.left))   { hr = layout.left;   hrad = kCornerRadius; }
-        else if (inRect(layout.right))  { hr = layout.right;  hrad = 0.0f; }
-        else if (inRect(layout.bottom)) { hr = layout.bottom; hrad = kCornerRadius; }
-        if (hr.extent.width > 0 && hr.extent.height > 0) {
-            VkClearColorValue hl = kPanelColor;
-            for (int c = 0; c < 3; ++c) hl.float32[c] = std::min(1.0f, hl.float32[c] * 1.22f + 0.035f);
-            DrawPanel(app, {hr, hl, hrad});
+        if ((GetKeyState(VK_LBUTTON) & 0x8000) != 0) {   // 左键按住中
+            VkRect2D hr{};
+            float hrad = 0.0f;
+            if      (inRect(layout.top))    { hr = layout.top;    hrad = 0.0f; }
+            else if (inRect(layout.left))   { hr = layout.left;   hrad = kCornerRadius; }
+            else if (inRect(layout.right))  { hr = layout.right;  hrad = 0.0f; }
+            else if (inRect(layout.bottom)) { hr = layout.bottom; hrad = kCornerRadius; }
+            if (hr.extent.width > 0 && hr.extent.height > 0) {
+                const VkClearColorValue kYellow = {{1.0f, 0.84f, 0.1f, 1.0f}};
+                // 面板色填充（恢复底色）+ 2px 黄色描边 → 只显示边缘亮边
+                DrawPanel(app, {hr, kPanelColor, hrad, kYellow, 2.0f});
+            }
         }
     }
 
@@ -6914,10 +6914,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         app.camera.orbitSensitivity = SensToFactor(50);
     }
 
-    // Round360：面板尺寸持久化（awa_settings.txt，仅当 >= 最小默认值才采纳）
+    // Round364：面板尺寸持久化——顶栏固定默认高度（不读 panel_top_h，取消顶栏缩放）；左/右/底可拖
+    app.panelTopH = kTopBarHeight;
     {
-        const int t = LoadSettingInt("panel_top_h", -1);
-        if (t >= static_cast<int>(kTopBarHeight))    app.panelTopH = static_cast<uint32_t>(t);
         const int l = LoadSettingInt("panel_left_w", -1);
         if (l >= static_cast<int>(kSideBarWidth))    app.panelLeftW = static_cast<uint32_t>(l);
         const int rr = LoadSettingInt("panel_right_w", -1);
