@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 # 版本号单一来源（用户 179 轮：不硬编码）——更新版本只需改这里的 VERSION（major.minor.patch）
-project(vulkan-blank VERSION 1.242.14 LANGUAGES CXX)
+project(vulkan-blank VERSION 1.242.15 LANGUAGES CXX)
 
 # 纯 Vulkan API 应用（Vulkan 1.0+ 双渲染路径 / C++20 / GPU 圆角矩形绘制）
 # 仅依赖 Vulkan 头文件/库 + 构建期 glslc，无任何第三方库
@@ -176,6 +176,27 @@ add_custom_command(
     DEPENDS ${SHADER_SRC_DIR}/fxaa.frag
     COMMENT "编译 FXAA 片元着色器 (fxaa.frag)")
 
+# Round370：选中物体屏幕投影描边（mask + Sobel 后处理）
+add_custom_command(
+    OUTPUT ${SHADER_GEN_DIR}/outline.vert.inc
+    COMMAND ${Vulkan_GLC_EXECUTABLE} ${SHADER_SRC_DIR}/outline.vert
+            -o ${SHADER_GEN_DIR}/outline.vert.spv
+    COMMAND ${PYTHON3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/spv_to_inc.py
+            ${SHADER_GEN_DIR}/outline.vert.spv
+            ${SHADER_GEN_DIR}/outline.vert.inc kOutlineVertSpv
+    DEPENDS ${SHADER_SRC_DIR}/outline.vert
+    COMMENT "编译选中描边顶点着色器 (outline.vert)")
+
+add_custom_command(
+    OUTPUT ${SHADER_GEN_DIR}/outline.frag.inc
+    COMMAND ${Vulkan_GLC_EXECUTABLE} ${SHADER_SRC_DIR}/outline.frag
+            -o ${SHADER_GEN_DIR}/outline.frag.spv
+    COMMAND ${PYTHON3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/spv_to_inc.py
+            ${SHADER_GEN_DIR}/outline.frag.spv
+            ${SHADER_GEN_DIR}/outline.frag.inc kOutlineFragSpv
+    DEPENDS ${SHADER_SRC_DIR}/outline.frag
+    COMMENT "编译选中描边片元着色器 (outline.frag)")
+
 # 警告 + 字符集（UTF-8 源文件 → 宽字面量正确转 UTF-16，否则 MinGW 按系统 ANSI 解释
 #   → L"示例.obj" 变乱码 → CreateFileW 找不到中文文件名 → 模型不加载）
 # ---- 版本号生成（用户 179 轮：单一来源 = 上方 project() 的 VERSION）----
@@ -235,6 +256,8 @@ add_executable(vulkan-blank WIN32
     ${SHADER_GEN_DIR}/text.frag.inc
     ${SHADER_GEN_DIR}/fxaa.vert.inc
     ${SHADER_GEN_DIR}/fxaa.frag.inc
+    ${SHADER_GEN_DIR}/outline.vert.inc   # Round370：选中描边
+    ${SHADER_GEN_DIR}/outline.frag.inc
     src/gear_png.inc)
 target_link_libraries(vulkan-blank PRIVATE windowscodecs comdlg32 ole32 shell32)
 target_include_directories(vulkan-blank PRIVATE ${SHADER_GEN_DIR} ${VERSION_GEN_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src ${Vulkan_INCLUDE_DIR})

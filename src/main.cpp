@@ -55,6 +55,8 @@
 #include <text.frag.inc>
 #include <fxaa.vert.inc>
 #include <fxaa.frag.inc>
+#include <outline.vert.inc>   // Round370：选中物体屏幕投影描边（mask + Sobel）
+#include <outline.frag.inc>
 
 #include <gear_png.inc>
 #include <pen_png.inc>
@@ -1504,6 +1506,35 @@ static void BuildObjectWireframe(SceneObject& o) {
             if (list.size() < 2) list.push_back(static_cast<uint32_t>(k / 3));
         }
     }
+    // Round369：特征边判定已移至 BuildFeatureVerts（延迟构建）；此处仅生成全部边线框
+    for (const auto& kv : adj) {
+        const auto& key = kv.first;
+        const uint32_t a = key.first, b = key.second;
+        o.wireVerts.push_back(WirePos{{o.solidVerts[a].pos[0], o.solidVerts[a].pos[1], o.solidVerts[a].pos[2]}});   // Round369：仅坐标
+        o.wireVerts.push_back(WirePos{{o.solidVerts[b].pos[0], o.solidVerts[b].pos[1], o.solidVerts[b].pos[2]}});
+        o.wireIndices.push_back(static_cast<uint32_t>(o.wireVerts.size()) - 2);
+        o.wireIndices.push_back(static_cast<uint32_t>(o.wireVerts.size()) - 1);
+        // Round369：featureVerts 已延迟——此处不再生成（见 BuildFeatureVerts）
+    }
+}
+
+// Round369：特征边（棱边+边界边）延迟构建——导入时不生成以省内存（大模型省 1/3~1/2 顶点内存），
+// 选中高亮需要时才调用（DrawSelectionOutline 内），缓存随选中物体变化失效
+static void BuildFeatureVerts(SceneObject& o) {
+    o.featureVerts.clear();
+    const auto& si = o.solidIndices;
+    const auto& sv = o.solidVerts;
+    if (si.size() < 3 || sv.empty()) return;
+    std::map<std::pair<uint32_t, uint32_t>, std::vector<uint32_t>> adj;
+    for (size_t k = 0; k + 2 < si.size(); k += 3) {
+        for (int e = 0; e < 3; ++e) {
+            const uint32_t a = si[k + e], b = si[k + (e + 1) % 3];
+            if (a >= sv.size() || b >= sv.size()) continue;
+            const auto key = std::make_pair(std::min(a, b), std::max(a, b));
+            auto& list = adj[key];
+            if (list.size() < 2) list.push_back(static_cast<uint32_t>(k / 3));
+        }
+    }
     constexpr float kCreaseCos = 0.866f;   // cos(30°)——法线夹角 > 30° 视为棱边
     for (const auto& kv : adj) {
         const auto& key = kv.first;
@@ -1512,21 +1543,16 @@ static void BuildObjectWireframe(SceneObject& o) {
         if (tris.size() == 1) {
             feature = true;   // 开放边界边（border，只属于一个面）
         } else {
-            const VertexSolid& v0 = o.solidVerts[si[tris[0] * 3]];
-            const VertexSolid& v1 = o.solidVerts[si[tris[1] * 3]];
+            const VertexSolid& v0 = sv[si[tris[0] * 3]];
+            const VertexSolid& v1 = sv[si[tris[1] * 3]];
             const float dot = v0.normal[0] * v1.normal[0] +
                               v0.normal[1] * v1.normal[1] +
                               v0.normal[2] * v1.normal[2];
             if (dot < kCreaseCos) feature = true;   // 法线夹角大 → 棱边
         }
-        const uint32_t a = key.first, b = key.second;
-        o.wireVerts.push_back(o.solidVerts[a]);
-        o.wireVerts.push_back(o.solidVerts[b]);
-        o.wireIndices.push_back(static_cast<uint32_t>(o.wireVerts.size()) - 2);
-        o.wireIndices.push_back(static_cast<uint32_t>(o.wireVerts.size()) - 1);
         if (feature) {
-            o.featureVerts.push_back(o.solidVerts[a]);
-            o.featureVerts.push_back(o.solidVerts[b]);
+            o.featureVerts.push_back(sv[key.first]);
+            o.featureVerts.push_back(sv[key.second]);
         }
     }
 }
@@ -1589,10 +1615,11 @@ static void BuildSelSilhouette(const SceneObject& o, App& app) {
 // 画法优先级：A=视相关 silhouette（正面/背面分界边 + 边界边）；轮廓边过多（>20 万）或无可计算数据时
 // 回退 B=静态棱边 featureVerts；C=索引线 wireIndices（importer 唯一点格式，修正 Round353 把唯一点当顶点对的 bug）；
 // D=顶点对 wireVerts（MC 合并网格）；全部为空 → E=AABB 黄框。
-static void DrawSelectionOutline(App& app, const SceneObject& sel, int selIndex, const float mvp[16]) {
+static void DrawSelectionOutline(App& app, SceneObject& sel, int selIndex, const float mvp[16]) {   // Round369：非 const（延迟构建特征边）
     if (app.pipelineLine3d == VK_NULL_HANDLE) return;
     // 缓存失效重建（拓扑不变仅变换时无需重建）
     if (app.selSilIndex != selIndex || app.selSilName != sel.name) {
+        sel.featureVerts.clear();   // Round369：缓存失效时释放旧物体特征边（延迟构建省内存）
         BuildSelSilhouette(sel, app);
         app.selSilIndex = selIndex;
         app.selSilName = sel.name;
@@ -1600,6 +1627,9 @@ static void DrawSelectionOutline(App& app, const SceneObject& sel, int selIndex,
     enum : int { kSil = 0, kFeature, kIndexed, kPairs, kAabb } mode = kSil;
     const bool big = app.selSilA.size() > 200000;   // 大物体免逐帧判定（轮廓边过多）
     if (app.selSilA.empty() || big) {
+        // Round369：特征边延迟构建（首次选中才生成；大物体 silhouette 过大回退用）
+        if (sel.featureVerts.empty() && !sel.solidIndices.empty() && !sel.solidVerts.empty())
+            BuildFeatureVerts(sel);
         if (!sel.featureVerts.empty())      mode = kFeature;
         else if (!sel.wireVerts.empty() && !sel.wireIndices.empty()) mode = kIndexed;
         else if (!sel.wireVerts.empty())    mode = kPairs;
@@ -1694,10 +1724,16 @@ static void DrawSelectionOutline(App& app, const SceneObject& sel, int selIndex,
     } else if (mode == kIndexed) {
         for (size_t i = 0; i + 1 < sel.wireIndices.size(); i += 2) {
             const uint32_t a = sel.wireIndices[i], b = sel.wireIndices[i + 1];
-            if (a < sel.wireVerts.size() && b < sel.wireVerts.size()) { v[vi++] = sel.wireVerts[a]; v[vi++] = sel.wireVerts[b]; }
+            if (a < sel.wireVerts.size() && b < sel.wireVerts.size()) {
+                v[vi].pos[0] = sel.wireVerts[a].pos[0]; v[vi].pos[1] = sel.wireVerts[a].pos[1]; v[vi].pos[2] = sel.wireVerts[a].pos[2]; ++vi;
+                v[vi].pos[0] = sel.wireVerts[b].pos[0]; v[vi].pos[1] = sel.wireVerts[b].pos[1]; v[vi].pos[2] = sel.wireVerts[b].pos[2]; ++vi;
+            }
         }
     } else if (mode == kPairs) {
-        for (const auto& a : sel.wireVerts) v[vi++] = a;
+        for (const auto& a : sel.wireVerts) {
+            v[vi].pos[0] = a.pos[0]; v[vi].pos[1] = a.pos[1]; v[vi].pos[2] = a.pos[2];   // Round369：WirePos 仅坐标（颜色由下方统一黄循环补）
+            ++vi;
+        }
     } else {   // kAabb：黄色 AABB 12 边
         const float minx = sel.boundsMin[0], miny = sel.boundsMin[1], minz = sel.boundsMin[2];
         const float maxx = sel.boundsMax[0], maxy = sel.boundsMax[1], maxz = sel.boundsMax[2];
@@ -1792,9 +1828,22 @@ static void Redo(App& app) {
     App::UndoEntry e = app.redoStack.back();
     app.redoStack.pop_back();
     switch (e.op) {
-    case App::UndoOp::Add:    // 重做添加：重新插入（副本，快照保持有效）
-        if (e.index >= 0 && e.index <= static_cast<int>(app.objects.size()))
-            app.objects.insert(app.objects.begin() + e.index, e.obj);
+    case App::UndoOp::Add:    // 重做添加：有导入路径 → 重新导入（Round371 操作式，不拷贝大模型）；否则快照插入（复制物体）
+        if (e.index >= 0 && e.index <= static_cast<int>(app.objects.size())) {
+            if (!e.importPath.empty()) {
+                SceneObject o;
+                try {
+                    if (ImportModelFile(e.importPath.c_str(), o)) {
+                        o.name = e.name;
+                        app.objects.insert(app.objects.begin() + e.index, std::move(o));
+                    }
+                } catch (const std::bad_alloc&) {
+                    SetError("内存不足：撤销/重做重新导入失败（模型过大）。");
+                }
+            } else {
+                app.objects.insert(app.objects.begin() + e.index, e.obj);
+            }
+        }
         break;
     case App::UndoOp::Remove: // 重做删除：再次移除
         if (e.index >= 0 && e.index < static_cast<int>(app.objects.size()))
@@ -1842,7 +1891,13 @@ static void DeleteSelectedObject(App& app) {
 static void DuplicateSelectedObject(App& app) {
     if (app.selectedObject < 0 || app.selectedObject >= static_cast<int>(app.objects.size())) return;
     vkDeviceWaitIdle(app.device);
-    SceneObject copy = app.objects[app.selectedObject];
+    SceneObject copy;
+    try {
+        copy = app.objects[app.selectedObject];
+    } catch (const std::bad_alloc&) {
+        SetError("内存不足：无法复制该物体（模型过大）。");
+        return;
+    }
     copy.tx += 1.5f;   // 偏移避免与原件重叠
     copy.name = copy.name + L" (复制)";
     app.objects.push_back(std::move(copy));
@@ -2941,10 +2996,25 @@ bool CreateSwapchain(App& app, VkSwapchainKHR oldSwapchain = VK_NULL_HANDLE) {
         g_pfnDestroySwapchainKHR(app.device, oldSwapchain, nullptr);
     }
 
+    // Round372：actualCount 初始化为 0；允许 INCOMPLETE（数组不足时合法返回值）——循环直到 SUCCESS
     uint32_t actualCount = 0;
-    VKB_TRY(g_pfnGetSwapchainImagesKHR(app.device, app.swapchain, &actualCount, nullptr));
+    VkResult imgRes = g_pfnGetSwapchainImagesKHR(app.device, app.swapchain, &actualCount, nullptr);
+    if (imgRes != VK_SUCCESS && imgRes != VK_INCOMPLETE) {
+        SetError(std::string("Vulkan 调用失败: vkGetSwapchainImagesKHR(nullptr) (VkResult=") + std::to_string(imgRes) + ")");
+        return false;
+    }
     app.swapchainImages.resize(actualCount);
-    VKB_TRY(g_pfnGetSwapchainImagesKHR(app.device, app.swapchain, &actualCount, app.swapchainImages.data()));
+    imgRes = g_pfnGetSwapchainImagesKHR(app.device, app.swapchain, &actualCount, app.swapchainImages.data());
+    while (imgRes == VK_INCOMPLETE) {  // resize 后图像数变化——重新查询并扩容
+        actualCount = 0;
+        g_pfnGetSwapchainImagesKHR(app.device, app.swapchain, &actualCount, nullptr);
+        app.swapchainImages.resize(actualCount);
+        imgRes = g_pfnGetSwapchainImagesKHR(app.device, app.swapchain, &actualCount, app.swapchainImages.data());
+    }
+    if (imgRes != VK_SUCCESS) {
+        SetError(std::string("Vulkan 调用失败: vkGetSwapchainImagesKHR(data) (VkResult=") + std::to_string(imgRes) + ")");
+        return false;
+    }
 
     app.swapchainImageViews.resize(actualCount);
     for (uint32_t i = 0; i < actualCount; ++i) {
@@ -3028,11 +3098,13 @@ bool CreateFramebuffers(App& app) {
 bool CreateDepthResources(App& app);
 bool CreateMSAAColorResources(App& app);
 bool CreateFXAAResources(App& app);
+bool CreateOutlineResources(App& app);   // Round370
 bool RecreateSwapchain(App& app) {
     vkQueueWaitIdle(app.graphicsQueue);
     if (!CreateSwapchain(app, app.swapchain)) return false;
     if (!CreateMSAAColorResources(app)) return false;
     if (!CreateFXAAResources(app)) return false;
+    if (!CreateOutlineResources(app)) return false;   // Round370：mask RT 随视口尺寸重建
     if (!CreateDepthResources(app)) return false;
     // 兼容路径（传统 render pass）需按新尺寸重建 framebuffer
     if (!app.useDynamicRendering && !CreateFramebuffers(app)) return false;
@@ -3105,10 +3177,11 @@ bool CreateVertexBuffer3D(App& app) {
     // 未算过 AABB 的物体先算（选中拾取用；导入/复制后自动维护）
     for (auto& o : app.objects)
         if (o.boundsMin[0] > 1e29f) ComputeObjectBounds(o);
-    // Round353：wireVerts 已由导入器按原始面生成（四边）。仅当 wireVerts 与 featureVerts 都空（如纯线物体）才用 solid 补建，
+    // Round353：wireVerts 已由导入器按原始面生成（四边）。仅当 wireVerts 空（如纯线物体）才用 solid 补建，
     // 否则会清掉已生成的四边 wireVerts（MC 合并网格尤其不能触发，否则对角线又回来）。
+    // Round369：featureVerts 已延迟构建，不再参与此条件（导入期恒空）
     for (auto& o : app.objects)
-        if (!o.solidIndices.empty() && o.wireVerts.empty() && o.featureVerts.empty())
+        if (!o.solidIndices.empty() && o.wireVerts.empty())
             BuildObjectWireframe(o);
     uint64_t totalVerts = 0, totalIndices = 0, totalWireVerts = 0;
     for (auto& o : app.objects) {
@@ -3120,7 +3193,8 @@ bool CreateVertexBuffer3D(App& app) {
         o.wireVtxOffset = static_cast<uint32_t>(totalWireVerts);   // Round269：专用 40B 缓冲偏移
         o.wireIndexOffset = static_cast<uint32_t>(totalIndices);
         o.solidIndexOffset = static_cast<uint32_t>(totalIndices) + wi;
-        totalVerts += static_cast<uint64_t>(wv) + sv;
+        // Round371：实体缓冲不再含 wireVerts 冗余副本（线框用独立 wireVtxBuffer3D，此副本从未被绘制引用）
+        totalVerts += static_cast<uint64_t>(sv);
         totalWireVerts += static_cast<uint64_t>(wv);
         totalIndices += static_cast<uint64_t>(wi) + si;
     }
@@ -3172,12 +3246,15 @@ bool CreateVertexBuffer3D(App& app) {
                            app.wireVtxBuffer3DCapacity, app.wireVtxBuffer3D, app.wireVtxBufferMemory3D)) return false;
 
     const VkDeviceSize stageSize = vertBytes + idxBytes + wireBytes;
+    // Round371：staging 分批上传——峰值 RAM 从「全部顶点+索引」降为固定 128MB 块
+    constexpr VkDeviceSize kUploadChunk = 128ull * 1024 * 1024;
+    const VkDeviceSize kStageChunk = (stageSize < kUploadChunk) ? stageSize : kUploadChunk;
     VkBuffer stageBuf = VK_NULL_HANDLE;
     VkDeviceMemory stageMem = VK_NULL_HANDLE;
     {
         VkBufferCreateInfo bi{};
         bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        bi.size = stageSize;
+        bi.size = kStageChunk;
         bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
         bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         VKB_TRY(vkCreateBuffer(app.device, &bi, nullptr, &stageBuf));
@@ -3194,66 +3271,130 @@ bool CreateVertexBuffer3D(App& app) {
         VKB_TRY(vkBindBufferMemory(app.device, stageBuf, stageMem, 0));
     }
 
-    void* mapped = nullptr;
-    VKB_TRY(vkMapMemory(app.device, stageMem, 0, stageSize, 0, &mapped));
-    {
-        char* base = static_cast<char*>(mapped);
-        size_t vOff = 0, iOff = 0;
-        // 按颜色位深逐顶点写入：pos(12) + normal(12) + color(位深压缩)
-        const auto copyVerts = [&](const std::vector<VertexSolid>& verts) {
-            const size_t n = verts.size();
-            if (n == 0) return;
-            char* dst = base + vOff;
-            for (size_t i = 0; i < n; ++i) {
-                const VertexSolid& v = verts[i];
-                std::memcpy(dst + i * vtxStride, v.pos, 12);
-                std::memcpy(dst + i * vtxStride + 12, v.normal, 12);
+    // Round371：分批生成 + 上传（每块 128MB）——先写 staging 块，记录 copy 区间，最后一次提交
+    struct ChunkRegion { VkBuffer dst; VkDeviceSize dstOff; VkDeviceSize size; };
+    std::vector<ChunkRegion> regions;
+    regions.reserve((stageSize / kStageChunk) + 8);
+    const auto mapStage = [&](VkDeviceSize bytes) -> char* {
+        void* mp = nullptr;
+        if (vkMapMemory(app.device, stageMem, 0, bytes, 0, &mp) != VK_SUCCESS) return nullptr;
+        return static_cast<char*>(mp);
+    };
+    // solidVerts 压缩写入（按全局顶点序号区间；o.vertexOffset = 该物体 solid 顶点起点）
+    const auto fillSolidRange = [&](uint64_t startV, uint64_t count, char* dst) {
+        for (const auto& o : app.objects) {
+            const uint64_t oStart = static_cast<uint64_t>(o.vertexOffset);
+            const uint64_t oEnd = oStart + o.solidVerts.size();
+            const uint64_t lo = std::max(startV, oStart);
+            const uint64_t hi = std::min(startV + count, oEnd);
+            if (lo >= hi) continue;
+            for (uint64_t i = lo; i < hi; ++i) {
+                const VertexSolid& v = o.solidVerts[i - oStart];
+                char* d = dst + (i - startV) * vtxStride;
+                std::memcpy(d, v.pos, 12);
+                std::memcpy(d + 12, v.normal, 12);
                 if (cmode == 1) {  // 16bit 半精度
                     uint16_t c[4];
                     for (int j = 0; j < 4; ++j) c[j] = FloatToHalf(v.color[j]);
-                    std::memcpy(dst + i * vtxStride + 24, c, 8);
+                    std::memcpy(d + 24, c, 8);
                 } else if (cmode == 2) {  // 8bit UNORM
                     uint8_t c[4];
                     for (int j = 0; j < 4; ++j)
                         c[j] = static_cast<uint8_t>(std::clamp(v.color[j], 0.0f, 1.0f) * 255.0f + 0.5f);
-                    std::memcpy(dst + i * vtxStride + 24, c, 4);
-                } else if (cmode == 3) {  // 4bit 打包 R4G4B4A4（R 低 4 位，小端）
+                    std::memcpy(d + 24, c, 4);
+                } else if (cmode == 3) {  // 4bit 打包
                     uint16_t c = 0;
                     for (int j = 0; j < 4; ++j) {
                         const uint8_t q = static_cast<uint8_t>(std::clamp(v.color[j], 0.0f, 1.0f) * 15.0f + 0.5f);
                         c |= static_cast<uint16_t>(q) << (j * 4);
                     }
-                    std::memcpy(dst + i * vtxStride + 24, &c, 2);
-                } else if (cmode == 4) {  // 1bit：单字节灰度（RGB 平均 → R8）
+                    std::memcpy(d + 24, &c, 2);
+                } else if (cmode == 4) {  // 1bit 灰度
                     const float lum = (v.color[0] + v.color[1] + v.color[2]) * (1.0f / 3.0f);
-                    dst[i * vtxStride + 24] = static_cast<uint8_t>(std::clamp(lum, 0.0f, 1.0f) * 255.0f + 0.5f);
+                    d[24] = static_cast<uint8_t>(std::clamp(lum, 0.0f, 1.0f) * 255.0f + 0.5f);
                 }
             }
-            vOff += n * vtxStride;
-        };
-        for (auto& o : app.objects) {
-            const size_t wi = o.wireIndices.size(), si = o.solidIndices.size();
-            copyVerts(o.wireVerts);
-            copyVerts(o.solidVerts);
-            if (wi) std::memcpy(base + vertBytes + iOff, o.wireIndices.data(), wi * sizeof(uint32_t));
-            iOff += wi * sizeof(uint32_t);
-            if (si) std::memcpy(base + vertBytes + iOff, o.solidIndices.data(), si * sizeof(uint32_t));
-            iOff += si * sizeof(uint32_t);
         }
-        // Round269：线框专用区（40B VertexSolid 原样，从 vertBytes+idxBytes 起）
-        if (wireBytes > 0) {
-            char* wbase = base + vertBytes + idxBytes;
-            size_t wOff = 0;
-            for (auto& o : app.objects) {
-                const size_t wv = o.wireVerts.size();
-                if (wv) {
-                    std::memcpy(wbase + wOff, o.wireVerts.data(), wv * sizeof(VertexSolid));
-                    wOff += wv * sizeof(VertexSolid);
+    };
+    // 索引区（wire 段 + solid 段；o.wireIndexOffset/solidIndexOffset 为全局索引偏移）
+    const auto fillIdxRange = [&](uint64_t startI, uint64_t count, uint32_t* dst) {
+        for (const auto& o : app.objects) {
+            const uint64_t w0 = static_cast<uint64_t>(o.wireIndexOffset);
+            const uint64_t s0 = static_cast<uint64_t>(o.solidIndexOffset);
+            for (int pass = 0; pass < 2; ++pass) {
+                const uint64_t segStart = (pass == 0) ? w0 : s0;
+                const uint64_t segLen = (pass == 0) ? o.wireIndices.size() : o.solidIndices.size();
+                const uint64_t lo = std::max(startI, segStart);
+                const uint64_t hi = std::min(startI + count, segStart + segLen);
+                if (lo >= hi) continue;
+                for (uint64_t i = lo; i < hi; ++i) {
+                    const uint32_t v = (pass == 0) ? o.wireIndices[i - segStart] : o.solidIndices[i - segStart];
+                    dst[i - startI] = v;
                 }
             }
+        }
+    };
+    // 线框区（12B pos → 40B VertexSolid 展开，统一灰白线色）
+    const auto fillWireRange = [&](uint64_t startW, uint64_t count, VertexSolid* dst) {
+        for (const auto& o : app.objects) {
+            const uint64_t oStart = static_cast<uint64_t>(o.wireVtxOffset);
+            const uint64_t oEnd = oStart + o.wireVerts.size();
+            const uint64_t lo = std::max(startW, oStart);
+            const uint64_t hi = std::min(startW + count, oEnd);
+            if (lo >= hi) continue;
+            for (uint64_t i = lo; i < hi; ++i) {
+                VertexSolid vs{};
+                vs.pos[0] = o.wireVerts[i - oStart].pos[0];
+                vs.pos[1] = o.wireVerts[i - oStart].pos[1];
+                vs.pos[2] = o.wireVerts[i - oStart].pos[2];
+                vs.normal[0] = 0.0f; vs.normal[1] = 1.0f; vs.normal[2] = 0.0f;
+                vs.color[0] = 0.72f; vs.color[1] = 0.72f; vs.color[2] = 0.74f; vs.color[3] = 1.0f;
+                dst[i - startW] = vs;
+            }
+        }
+    };
+    // vert 区
+    {
+        uint64_t globalV = 0;
+        while (globalV * vtxStride < vertBytes) {
+            const VkDeviceSize chunkBytes = std::min<VkDeviceSize>(kStageChunk, vertBytes - globalV * vtxStride);
+            const uint64_t count = chunkBytes / vtxStride;
+            char* mp = mapStage(chunkBytes);
+            if (!mp) return false;
+            fillSolidRange(globalV, count, mp);
+            vkUnmapMemory(app.device, stageMem);
+            regions.push_back({app.vertexBuffer3D, globalV * vtxStride, chunkBytes});
+            globalV += count;
         }
     }
-    vkUnmapMemory(app.device, stageMem);
+    // idx 区
+    if (idxBytes > 0) {
+        uint64_t globalI = 0;
+        while (globalI * 4 < idxBytes) {
+            const VkDeviceSize chunkBytes = std::min<VkDeviceSize>(kStageChunk, idxBytes - globalI * 4);
+            const uint64_t count = chunkBytes / 4;
+            char* mp = mapStage(chunkBytes);
+            if (!mp) return false;
+            fillIdxRange(globalI, count, reinterpret_cast<uint32_t*>(mp));
+            vkUnmapMemory(app.device, stageMem);
+            regions.push_back({app.indexBuffer3D, globalI * 4, chunkBytes});
+            globalI += count;
+        }
+    }
+    // wire 区
+    if (wireBytes > 0) {
+        uint64_t globalW = 0;
+        while (globalW * sizeof(VertexSolid) < wireBytes) {
+            const VkDeviceSize chunkBytes = std::min<VkDeviceSize>(kStageChunk, wireBytes - globalW * sizeof(VertexSolid));
+            const uint64_t count = chunkBytes / sizeof(VertexSolid);
+            char* mp = mapStage(chunkBytes);
+            if (!mp) return false;
+            fillWireRange(globalW, count, reinterpret_cast<VertexSolid*>(mp));
+            vkUnmapMemory(app.device, stageMem);
+            regions.push_back({app.wireVtxBuffer3D, globalW * sizeof(VertexSolid), chunkBytes});
+            globalW += count;
+        }
+    }
 
     {
         VkCommandPool pool = VK_NULL_HANDLE;
@@ -3273,27 +3414,56 @@ bool CreateVertexBuffer3D(App& app) {
         b.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         b.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         VKB_TRY(vkBeginCommandBuffer(cmd, &b));
-        VkBufferCopy region{};
-        region.srcOffset = 0; region.dstOffset = 0; region.size = vertBytes;
-        vkCmdCopyBuffer(cmd, stageBuf, app.vertexBuffer3D, 1, &region);
-        region.srcOffset = vertBytes; region.dstOffset = 0; region.size = idxBytes;
-        vkCmdCopyBuffer(cmd, stageBuf, app.indexBuffer3D, 1, &region);
-        if (wireBytes > 0) {
-            region.srcOffset = vertBytes + idxBytes; region.dstOffset = 0; region.size = wireBytes;
-            vkCmdCopyBuffer(cmd, stageBuf, app.wireVtxBuffer3D, 1, &region);
+        // 每块：staging(HOST_WRITE) → TRANSFER_READ barrier → copy
+        for (const auto& rg : regions) {
+            VkBufferMemoryBarrier bb{};
+            bb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            bb.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+            bb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bb.buffer = stageBuf;
+            bb.offset = 0;
+            bb.size = rg.size;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 0, 0, nullptr, 1, &bb, 0, nullptr);
+            VkBufferCopy region{};
+            region.srcOffset = 0; region.dstOffset = rg.dstOff; region.size = rg.size;
+            vkCmdCopyBuffer(cmd, stageBuf, rg.dst, 1, &region);
         }
         VKB_TRY(vkEndCommandBuffer(cmd));
         VkSubmitInfo s{};
         s.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         s.commandBufferCount = 1;
         s.pCommandBuffers = &cmd;
-        VKB_TRY(vkQueueSubmit(app.graphicsQueue, 1, &s, VK_NULL_HANDLE));
-        VKB_TRY(vkQueueWaitIdle(app.graphicsQueue));
+        // Round372→Round373：vkQueueSubmit 偶发返 INCOMPLETE/DEVICE_LOST（驱动 TDR/超时/显存压力）
+        // INCOMPLETE 重试一次；DEVICE_LOST(-4)/OUT_OF_* 不弹窗（下一帧重建 swapchain 自动恢复）
+        VkResult submitRes = vkQueueSubmit(app.graphicsQueue, 1, &s, VK_NULL_HANDLE);
+        if (submitRes == VK_INCOMPLETE) submitRes = vkQueueSubmit(app.graphicsQueue, 1, &s, VK_NULL_HANDLE);
+        if (submitRes != VK_SUCCESS && submitRes != VK_SUBOPTIMAL_KHR) {
+            // Round373：DEVICE_LOST / OUT_OF_HOST|DEVICE_MEMORY 等驱动级错误——静默不弹窗
+            // 数据已写入 GPU 缓冲，只是命令未执行；下一帧 DrawFrame 的 RecreateSwapchain 会自动恢复
+            if (submitRes != VK_ERROR_DEVICE_LOST &&
+                submitRes != VK_ERROR_OUT_OF_HOST_MEMORY &&
+                submitRes != VK_ERROR_OUT_OF_DEVICE_MEMORY)
+                VKB_TRY(submitRes);
+        }
+        // Round374：vkQueueWaitIdle 同样偶发 DEVICE_LOST(-4)/OUT_OF_*（驱动 TDR/超时），
+        // 与上方 vkQueueSubmit 一致——静默不弹窗，下一帧 RecreateSwapchain 自动恢复
+        {
+            VkResult waitRes = vkQueueWaitIdle(app.graphicsQueue);
+            if (waitRes != VK_SUCCESS && waitRes != VK_SUBOPTIMAL_KHR) {
+                if (waitRes != VK_ERROR_DEVICE_LOST &&
+                    waitRes != VK_ERROR_OUT_OF_HOST_MEMORY &&
+                    waitRes != VK_ERROR_OUT_OF_DEVICE_MEMORY)
+                    VKB_TRY(waitRes);
+            }
+        }
         vkFreeCommandBuffers(app.device, pool, 1, &cmd);
         vkDestroyCommandPool(app.device, pool, nullptr);
     }
 
-    vkDestroyBuffer(app.device, stageBuf, nullptr);
+        vkDestroyBuffer(app.device, stageBuf, nullptr);
     vkFreeMemory(app.device, stageMem, nullptr);
     return true;
 }
@@ -3959,6 +4129,262 @@ bool CreatePipelineFXAA(App& app) {
 
     VkResult res = vkCreateGraphicsPipelines(app.device, VK_NULL_HANDLE, 1, &pipelineInfo,
                                              nullptr, &app.fxaaPipeline);
+    vkDestroyShaderModule(app.device, vertModule, nullptr);
+    vkDestroyShaderModule(app.device, fragModule, nullptr);
+    VKB_TRY(res);
+    return true;
+}
+
+// ==================== Round370：选中物体屏幕投影描边（mask RT + Sobel 后处理）====================
+// mask RT（选中物体渲染为实体色）→ outline pass（Sobel 边缘检测 → 黄色描边叠加）
+bool CreateOutlineResources(App& app) {
+    const VkExtent2D& e = app.swapchainExtent;
+    if (e.width == 0 || e.height == 0) return false;
+    // 销毁旧资源（resize 重建；descriptor layout 复用不销毁）
+    if (app.outlineView)   vkDestroyImageView(app.device, app.outlineView, nullptr);
+    if (app.outlineImage)  vkDestroyImage(app.device, app.outlineImage, nullptr);
+    if (app.outlineMemory) vkFreeMemory(app.device, app.outlineMemory, nullptr);
+    if (app.outlineDepthView)   vkDestroyImageView(app.device, app.outlineDepthView, nullptr);
+    if (app.outlineDepthImage)  vkDestroyImage(app.device, app.outlineDepthImage, nullptr);
+    if (app.outlineDepthMemory) vkFreeMemory(app.device, app.outlineDepthMemory, nullptr);
+    app.outlineView = VK_NULL_HANDLE; app.outlineImage = VK_NULL_HANDLE; app.outlineMemory = VK_NULL_HANDLE;
+    app.outlineDepthView = VK_NULL_HANDLE; app.outlineDepthImage = VK_NULL_HANDLE; app.outlineDepthMemory = VK_NULL_HANDLE;
+
+    // mask RT（R8G8B8A8 UNORM，COLOR_ATTACHMENT | SAMPLED）
+    VkImageCreateInfo imgInfo{};
+    imgInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imgInfo.imageType = VK_IMAGE_TYPE_2D;
+    imgInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    imgInfo.extent = {e.width, e.height, 1};
+    imgInfo.mipLevels = 1;
+    imgInfo.arrayLayers = 1;
+    imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imgInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    imgInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VKB_TRY(vkCreateImage(app.device, &imgInfo, nullptr, &app.outlineImage));
+
+    VkPhysicalDeviceMemoryProperties memProps;
+    vkGetPhysicalDeviceMemoryProperties(app.physicalDevice, &memProps);
+    uint32_t memTypeIndex = UINT32_MAX;
+    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i)
+        if ((memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ==
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) { memTypeIndex = i; break; }
+    if (memTypeIndex == UINT32_MAX) return false;
+    VkMemoryRequirements memReq;
+    vkGetImageMemoryRequirements(app.device, app.outlineImage, &memReq);
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memReq.size;
+    allocInfo.memoryTypeIndex = memTypeIndex;
+    VKB_TRY(vkAllocateMemory(app.device, &allocInfo, nullptr, &app.outlineMemory));
+    VKB_TRY(vkBindImageMemory(app.device, app.outlineImage, app.outlineMemory, 0));
+
+    VkImageViewCreateInfo vi{};
+    vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vi.image = app.outlineImage;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+    vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    vi.subresourceRange.levelCount = 1;
+    vi.subresourceRange.layerCount = 1;
+    VKB_TRY(vkCreateImageView(app.device, &vi, nullptr, &app.outlineView));
+
+    // mask pass 专用深度（1x D32，独立于主帧——主帧深度可能是 MSAA 采样数，不能直接复用）
+    VkImageCreateInfo di{};
+    di.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    di.imageType = VK_IMAGE_TYPE_2D;
+    di.format = VK_FORMAT_D32_SFLOAT;
+    di.extent = {e.width, e.height, 1};
+    di.mipLevels = 1;
+    di.arrayLayers = 1;
+    di.samples = VK_SAMPLE_COUNT_1_BIT;
+    di.tiling = VK_IMAGE_TILING_OPTIMAL;
+    di.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    di.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    di.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VKB_TRY(vkCreateImage(app.device, &di, nullptr, &app.outlineDepthImage));
+    VkMemoryRequirements dmr;
+    vkGetImageMemoryRequirements(app.device, app.outlineDepthImage, &dmr);
+    VkMemoryAllocateInfo da{};
+    da.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    da.allocationSize = dmr.size;
+    da.memoryTypeIndex = memTypeIndex;
+    VKB_TRY(vkAllocateMemory(app.device, &da, nullptr, &app.outlineDepthMemory));
+    VKB_TRY(vkBindImageMemory(app.device, app.outlineDepthImage, app.outlineDepthMemory, 0));
+    VkImageViewCreateInfo dv{};
+    dv.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    dv.image = app.outlineDepthImage;
+    dv.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    dv.format = VK_FORMAT_D32_SFLOAT;
+    dv.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    dv.subresourceRange.levelCount = 1;
+    dv.subresourceRange.layerCount = 1;
+    VKB_TRY(vkCreateImageView(app.device, &dv, nullptr, &app.outlineDepthView));
+
+    // sampler（NEAREST：Sobel 需要精确 texel 采样）
+    VkSamplerCreateInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    si.magFilter = VK_FILTER_NEAREST;
+    si.minFilter = VK_FILTER_NEAREST;
+    si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    si.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    si.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    si.maxLod = 0.0f;
+    VKB_TRY(vkCreateSampler(app.device, &si, nullptr, &app.outlineSampler));
+
+    if (app.outlineDescriptorLayout == VK_NULL_HANDLE) {
+        VkDescriptorSetLayoutBinding binding{};
+        binding.binding = 0;
+        binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        binding.descriptorCount = 1;
+        binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutCreateInfo dl{};
+        dl.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        dl.bindingCount = 1;
+        dl.pBindings = &binding;
+        VKB_TRY(vkCreateDescriptorSetLayout(app.device, &dl, nullptr, &app.outlineDescriptorLayout));
+    }
+    VkDescriptorPoolSize poolSize{};
+    poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    poolSize.descriptorCount = 1;
+    VkDescriptorPoolCreateInfo dp{};
+    dp.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dp.maxSets = 1;
+    dp.poolSizeCount = 1;
+    dp.pPoolSizes = &poolSize;
+    VKB_TRY(vkCreateDescriptorPool(app.device, &dp, nullptr, &app.outlineDescriptorPool));
+    VkDescriptorSetAllocateInfo dsa{};
+    dsa.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsa.descriptorPool = app.outlineDescriptorPool;
+    dsa.descriptorSetCount = 1;
+    dsa.pSetLayouts = &app.outlineDescriptorLayout;
+    VKB_TRY(vkAllocateDescriptorSets(app.device, &dsa, &app.outlineDescriptorSet));
+    VkDescriptorImageInfo dii{};
+    dii.sampler = app.outlineSampler;
+    dii.imageView = app.outlineView;
+    dii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet wd{};
+    wd.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    wd.dstSet = app.outlineDescriptorSet;
+    wd.dstBinding = 0;
+    wd.descriptorCount = 1;
+    wd.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    wd.pImageInfo = &dii;
+    vkUpdateDescriptorSets(app.device, 1, &wd, 0, nullptr);
+    return true;
+}
+
+bool CreatePipelineOutline(App& app) {
+    VkShaderModule vertModule = VK_NULL_HANDLE;
+    VkShaderModule fragModule = VK_NULL_HANDLE;
+    if (!CreateShaderModule(app.device, kOutlineVertSpv, kOutlineVertSpvSize, vertModule) ||
+        !CreateShaderModule(app.device, kOutlineFragSpv, kOutlineFragSpvSize, fragModule)) {
+        SetError("选中描边着色器模块创建失败");
+        return false;
+    }
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vertModule;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = fragModule;
+    stages[1].pName = "main";
+
+    VkVertexInputBindingDescription binding{};
+    binding.binding = 0;
+    binding.stride = 2 * sizeof(float);
+    binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    VkVertexInputAttributeDescription attribute{};
+    attribute.location = 0;
+    attribute.binding = 0;
+    attribute.format = VK_FORMAT_R32G32_SFLOAT;
+    attribute.offset = 0;
+    VkPipelineVertexInputStateCreateInfo vertexInput{};
+    vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vertexInput.vertexBindingDescriptionCount = 1;
+    vertexInput.pVertexBindingDescriptions = &binding;
+    vertexInput.vertexAttributeDescriptionCount = 1;
+    vertexInput.pVertexAttributeDescriptions = &attribute;
+
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
+    inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo viewportState{};
+    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1;
+    viewportState.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rasterizer{};
+    rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
+    rasterizer.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo multisample{};
+    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo depthStencil{};
+    depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depthStencil.depthTestEnable = VK_FALSE;
+    depthStencil.depthWriteEnable = VK_FALSE;
+    // alpha blend：黄线（alpha=1）覆盖，非边缘（alpha=0）保留底下画面
+    VkPipelineColorBlendAttachmentState blendAttachment{};
+    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                     VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    blendAttachment.blendEnable = VK_TRUE;
+    blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    blendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+    blendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    blendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    blendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+    VkPipelineColorBlendStateCreateInfo colorBlend{};
+    colorBlend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlend.attachmentCount = 1;
+    colorBlend.pAttachments = &blendAttachment;
+    VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamicState{};
+    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamicState.dynamicStateCount = 2;
+    dynamicState.pDynamicStates = dynamicStates;
+
+    VkPushConstantRange pushRange{};
+    pushRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    pushRange.offset = 0;
+    pushRange.size = 2 * sizeof(float);
+    VkPipelineLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layoutInfo.setLayoutCount = 1;
+    layoutInfo.pSetLayouts = &app.outlineDescriptorLayout;
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges = &pushRange;
+    VKB_TRY(vkCreatePipelineLayout(app.device, &layoutInfo, nullptr, &app.outlinePipelineLayout));
+
+    VkPipelineRenderingCreateInfo renderingInfo{};
+    renderingInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    renderingInfo.colorAttachmentCount = 1;
+    renderingInfo.pColorAttachmentFormats = &app.swapchainFormat;
+    VkGraphicsPipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineInfo.pNext = app.useDynamicRendering ? &renderingInfo : nullptr;
+    pipelineInfo.stageCount = 2;
+    pipelineInfo.pStages = stages;
+    pipelineInfo.pVertexInputState = &vertexInput;
+    pipelineInfo.pInputAssemblyState = &inputAssembly;
+    pipelineInfo.pViewportState = &viewportState;
+    pipelineInfo.pRasterizationState = &rasterizer;
+    pipelineInfo.pMultisampleState = &multisample;
+    pipelineInfo.pDepthStencilState = &depthStencil;
+    pipelineInfo.pColorBlendState = &colorBlend;
+    pipelineInfo.pDynamicState = &dynamicState;
+    pipelineInfo.layout = app.outlinePipelineLayout;
+    pipelineInfo.renderPass = app.useDynamicRendering ? VK_NULL_HANDLE : app.renderPass;
+    pipelineInfo.subpass = 0;
+    VkResult res = vkCreateGraphicsPipelines(app.device, VK_NULL_HANDLE, 1, &pipelineInfo,
+                                             nullptr, &app.outlinePipeline);
     vkDestroyShaderModule(app.device, vertModule, nullptr);
     vkDestroyShaderModule(app.device, fragModule, nullptr);
     VKB_TRY(res);
@@ -6092,7 +6518,10 @@ void DrawFrame(App& app) {
     }
     if (app.swapchainExtent.width == 0 || app.swapchainExtent.height == 0) return;
 
-    vkWaitForFences(app.device, 1, &app.inFlightFence, VK_TRUE, UINT64_MAX);
+    // Round375：有限超时(2s)替代 UINT64_MAX——设备丢失/命令未完成时不再永久阻塞主线程（"卡死"根因之一）。
+    // 非 SUCCESS（超时/DEVICE_LOST/…）即跳过本帧，保持消息循环存活 → UI 不冻结；设备恢复后自动继续。
+    VkResult fenceRes = vkWaitForFences(app.device, 1, &app.inFlightFence, VK_TRUE, 2000000000ull);
+    if (fenceRes != VK_SUCCESS) return;
 
     uint32_t imageIndex = 0;
     VkResult result = g_pfnAcquireNextImageKHR(app.device, app.swapchain, UINT64_MAX,
@@ -6280,17 +6709,18 @@ void DrawFrame(App& app) {
             vkCmdPushConstants(app.commandBuffer, app.pipelineLayoutSolid,
                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                0, sizeof(Push3D), &push3d);
+            // Round375：solidIndices 为局部索引(0..sv-1)，vertexBuffer3D 现只含 solid 顶点
+            // （Round371 已移除 wire 冗余副本），firstVertex 必须=obj.vertexOffset 起点。
+            // 旧代码 +obj.wireVerts.size() 是 Round371 前的布局残留——会越界读 GPU 缓冲→设备丢失→卡死。
             vkCmdDrawIndexed(app.commandBuffer, n, 1, obj.solidIndexOffset,
-                             static_cast<int32_t>(obj.vertexOffset) +
-                                 static_cast<int32_t>(obj.wireVerts.size()),
-                             0);
+                             static_cast<int32_t>(obj.vertexOffset), 0);
         }
     }
 
     // ===== 选中物体高亮/线框预览（Round237，Blender 风格）=====
     if (app.pipelineLine3d != VK_NULL_HANDLE && app.selectedObject >= 0 &&
         app.selectedObject < static_cast<int>(app.objects.size())) {
-        const SceneObject& sel = app.objects[app.selectedObject];
+        SceneObject& sel = app.objects[app.selectedObject];   // Round369：非 const（DrawSelectionOutline 延迟构建特征边）
         if (app.renderMode != 1 && app.wireframeSel && !sel.wireIndices.empty()) {
             // Tab：线框预览——画 wireIndices（模型矩阵含平移）
             float model[16] = {};
@@ -6307,9 +6737,11 @@ void DrawFrame(App& app) {
             vkCmdDrawIndexed(app.commandBuffer, static_cast<uint32_t>(sel.wireIndices.size()), 1,
                              sel.wireIndexOffset, sel.wireVtxOffset, 0);
         } else {
-            // Round359：外轮廓描边——视相关 silhouette（正面/背面分界边 + 边界边），2px 黄线
-            // 替换 Round353「黄边包边」：旧实现把 importer 的唯一点 wireVerts 当顶点对非索引绘制 → 导入模型高亮乱线/不可见
-            DrawSelectionOutline(app, sel, app.selectedObject, mvp);
+            // Round370：选中描边改为屏幕空间后处理（mask + Sobel，见 DrawFrame 的 mask/outline pass）；
+            // 传统 render pass 路径无后处理，保留旧 3D silhouette 黄线兜底
+            if (!app.useDynamicRendering) {
+                DrawSelectionOutline(app, sel, app.selectedObject, mvp);
+            }
     }
     }
 
@@ -6524,6 +6956,89 @@ void DrawFrame(App& app) {
         }
     }
 
+    // ==================== Round370：选中物体屏幕投影描边（mask + Sobel 后处理）====================
+    const bool selValid = (app.selectedObject >= 0 &&
+                           app.selectedObject < static_cast<int>(app.objects.size()));
+    // 选中物体实体 → maskRT（白色区域 = Sobel 检测输入）；mask pass 为独立 rendering
+    const auto drawSelectionMask = [&]() {
+        if (app.outlinePipeline == VK_NULL_HANDLE || app.outlineView == VK_NULL_HANDLE ||
+            app.vertexBuffer3D == VK_NULL_HANDLE || app.indexBuffer3D == VK_NULL_HANDLE || !selValid) return;
+        ImageBarrier(app, app.outlineImage,
+                     VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+        ImageBarrierAspect(app, app.outlineDepthImage, VK_IMAGE_ASPECT_DEPTH_BIT,
+                           VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                           VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+                           VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+        VkRenderingAttachmentInfo maskColor{};
+        maskColor.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        maskColor.imageView = app.outlineView;
+        maskColor.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        maskColor.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        maskColor.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        maskColor.clearValue.color = {{0.0f, 0.0f, 0.0f, 0.0f}};
+        VkRenderingAttachmentInfo maskDepth{};
+        maskDepth.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        maskDepth.imageView = app.outlineDepthView;
+        maskDepth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        maskDepth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        maskDepth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        maskDepth.clearValue.depthStencil = {1.0f, 0};
+        VkRenderingInfo maskInfo{};
+        maskInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        maskInfo.renderArea = fullArea;
+        maskInfo.layerCount = 1;
+        maskInfo.colorAttachmentCount = 1;
+        maskInfo.pColorAttachments = &maskColor;
+        maskInfo.pDepthAttachment = &maskDepth;
+        g_pfnCmdBeginRendering(app.commandBuffer, &maskInfo);
+        vkCmdSetViewport(app.commandBuffer, 0, 1, &viewport);
+        vkCmdSetScissor(app.commandBuffer, 0, 1, &layout.viewport);
+        const SceneObject& selObj = app.objects[static_cast<size_t>(app.selectedObject)];
+        const uint32_t n = static_cast<uint32_t>(selObj.solidIndices.size());
+        if (n > 0) {
+            const int cmode2 = app.vertexColorMode < 0 ? 0 : (app.vertexColorMode > 4 ? 4 : app.vertexColorMode);
+            VkPipeline solidPipe2 = app.pipelineSolidNoColor;
+            if (cmode2 == 1) solidPipe2 = app.pipelineSolid;
+            else if (cmode2 == 2) solidPipe2 = app.pipelineSolid8;
+            else if (cmode2 == 3) solidPipe2 = app.pipelineSolid4;
+            else if (cmode2 == 4) solidPipe2 = app.pipelineSolid1;
+            vkCmdBindPipeline(app.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, solidPipe2);
+            VkDeviceSize off0 = 0;
+            vkCmdBindVertexBuffers(app.commandBuffer, 0, 1, &app.vertexBuffer3D, &off0);
+            vkCmdBindIndexBuffer(app.commandBuffer, app.indexBuffer3D, off0, VK_INDEX_TYPE_UINT32);
+            float model2[16] = {};
+            BuildModelMatrix(selObj, model2);
+            float mvpm2[16];
+            MatMul4(mvp, model2, mvpm2);
+            Push3D push3d2{};
+            std::memcpy(push3d2.mvp, mvpm2, 64);
+            push3d2.mode = 1.0f;
+            push3d2.gridRadius = kDefaultFadeRadius;
+            push3d2.modelRadius = kDefaultFadeRadius;
+            push3d2.hasColor = (cmode2 == 0) ? 0.0f : (cmode2 == 4 ? 2.0f : 1.0f);
+            push3d2.camXZ[0] = app.fadeCenterXZ[0];
+            push3d2.camXZ[1] = app.fadeCenterXZ[1];
+            vkCmdPushConstants(app.commandBuffer, app.pipelineLayoutSolid,
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(Push3D), &push3d2);
+            // Round375：与普通实体绘制一致——solidIndices 为局部索引，firstVertex=selObj.vertexOffset
+            vkCmdDrawIndexed(app.commandBuffer, n, 1, selObj.solidIndexOffset,
+                             static_cast<int32_t>(selObj.vertexOffset), 0);
+        }
+        g_pfnCmdEndRendering(app.commandBuffer);
+        ImageBarrier(app, app.outlineImage,
+                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+    };
+    // 3D pass 统一结束：fxaa 模式在下方块内 End；非 fxaa 在此补 End（2D 原在同一 pass，需拆出）
+    if (app.useDynamicRendering && !fxaa) {
+        g_pfnCmdEndRendering(app.commandBuffer);
+        drawSelectionMask();
+    }
+
     // ==== FXAA 模式：3D 已渲染到中间纹理 → 结束 3D pass → FXAA 后处理 → swapchain ====
     if (fxaa) {
         g_pfnCmdEndRendering(app.commandBuffer);
@@ -6531,6 +7046,7 @@ void DrawFrame(App& app) {
                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
                      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+        drawSelectionMask();   // Round370：fxaa 模式下 mask pass 插在 FXAA 合成前
         VkRenderingAttachmentInfo colorAttachment2{};
         colorAttachment2.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
         colorAttachment2.imageView = app.swapchainImageViews[imageIndex];
@@ -6555,6 +7071,39 @@ void DrawFrame(App& app) {
         const float invScreen[2] = {1.0f / static_cast<float>(app.swapchainExtent.width),
                                     1.0f / static_cast<float>(app.swapchainExtent.height)};
         vkCmdPushConstants(app.commandBuffer, app.fxaaPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(invScreen), invScreen);
+        vkCmdDraw(app.commandBuffer, 6, 1, 0, 0);
+    }
+
+    // Round370：非 fxaa 模式——3D pass 已提前结束，为 2D 面板开启合成 rendering（LOAD swapchain）
+    if (app.useDynamicRendering && !fxaa) {
+        VkRenderingAttachmentInfo colorUI{};
+        colorUI.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        colorUI.imageView = app.swapchainImageViews[imageIndex];
+        colorUI.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        colorUI.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        colorUI.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        VkRenderingInfo uiInfo{};
+        uiInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        uiInfo.renderArea = fullArea;
+        uiInfo.layerCount = 1;
+        uiInfo.colorAttachmentCount = 1;
+        uiInfo.pColorAttachments = &colorUI;
+        g_pfnCmdBeginRendering(app.commandBuffer, &uiInfo);
+    }
+
+    // Round370：选中描边——Sobel(mask) 黄线叠加（fxaa：renderInfo2 内；非 fxaa：UI rendering 内；blend 保留底下画面）
+    if (app.useDynamicRendering && app.outlinePipeline != VK_NULL_HANDLE &&
+        app.outlineDescriptorSet != VK_NULL_HANDLE && selValid) {
+        vkCmdSetViewport(app.commandBuffer, 0, 1, &viewport);
+        vkCmdSetScissor(app.commandBuffer, 0, 1, &fullArea);
+        vkCmdBindPipeline(app.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.outlinePipeline);
+        vkCmdBindVertexBuffers(app.commandBuffer, 0, 1, &app.vertexBuffer, &vertexOffset);
+        vkCmdBindDescriptorSets(app.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                app.outlinePipelineLayout, 0, 1, &app.outlineDescriptorSet, 0, nullptr);
+        const float invScreen[2] = {1.0f / static_cast<float>(app.swapchainExtent.width),
+                                    1.0f / static_cast<float>(app.swapchainExtent.height)};
+        vkCmdPushConstants(app.commandBuffer, app.outlinePipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(invScreen), invScreen);
         vkCmdDraw(app.commandBuffer, 6, 1, 0, 0);
     }
@@ -6656,7 +7205,7 @@ bool ApplyAAMode(App& app, AAMode mode) {
     if (!CreatePipeline(app) || !CreateMenuPipeline(app) ||
         !CreatePipelineGrid(app) || !CreatePipelineSolid(app) ||
         !CreatePipelineAxis(app) || !CreatePipelineLine3d(app) ||
-        !CreatePipelineFXAA(app) ||
+        !CreatePipelineFXAA(app) || !CreatePipelineOutline(app) ||   // Round370
         !CreateTextPipeline(app)) {
         SetError("抗锯齿管线重建失败");
         return false;
@@ -6669,6 +7218,32 @@ void Cleanup(App& app) {
     CloseSettingsWindow();
     if (app.device != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(app.device);
+        // Round369：标签纹理释放（image/view/memory；descriptor set 随 textDescriptorPool 统一销毁）
+        const auto freeLabel = [&](App::LabelTexture& lt) {
+            if (lt.view)   vkDestroyImageView(app.device, lt.view, nullptr);
+            if (lt.image)  vkDestroyImage(app.device, lt.image, nullptr);
+            if (lt.memory) vkFreeMemory(app.device, lt.memory, nullptr);
+            lt.view = VK_NULL_HANDLE; lt.image = VK_NULL_HANDLE; lt.memory = VK_NULL_HANDLE;
+        };
+        freeLabel(app.objNameLabel);
+        freeLabel(app.scaleLabel);
+        freeLabel(app.importUpLabel);
+        for (auto& lt : app.coordLabels) freeLabel(lt);
+        // Round370：选中描边资源释放（descriptor layout 随 device 销毁；pool/pipeline 显式释放）
+        if (app.outlinePipeline != VK_NULL_HANDLE) vkDestroyPipeline(app.device, app.outlinePipeline, nullptr);
+        if (app.outlinePipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(app.device, app.outlinePipelineLayout, nullptr);
+        if (app.outlineDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(app.device, app.outlineDescriptorPool, nullptr);
+        if (app.outlineSampler != VK_NULL_HANDLE) vkDestroySampler(app.device, app.outlineSampler, nullptr);
+        if (app.outlineDepthView)  vkDestroyImageView(app.device, app.outlineDepthView, nullptr);
+        if (app.outlineDepthImage) vkDestroyImage(app.device, app.outlineDepthImage, nullptr);
+        if (app.outlineDepthMemory) vkFreeMemory(app.device, app.outlineDepthMemory, nullptr);
+        if (app.outlineView)   vkDestroyImageView(app.device, app.outlineView, nullptr);
+        if (app.outlineImage)  vkDestroyImage(app.device, app.outlineImage, nullptr);
+        if (app.outlineMemory) vkFreeMemory(app.device, app.outlineMemory, nullptr);
+        app.outlinePipeline = VK_NULL_HANDLE; app.outlinePipelineLayout = VK_NULL_HANDLE;
+        app.outlineDescriptorPool = VK_NULL_HANDLE; app.outlineSampler = VK_NULL_HANDLE;
+        app.outlineDepthView = VK_NULL_HANDLE; app.outlineDepthImage = VK_NULL_HANDLE; app.outlineDepthMemory = VK_NULL_HANDLE;
+        app.outlineView = VK_NULL_HANDLE; app.outlineImage = VK_NULL_HANDLE; app.outlineMemory = VK_NULL_HANDLE;
         if (app.inFlightFence != VK_NULL_HANDLE) vkDestroyFence(app.device, app.inFlightFence, nullptr);
         if (app.renderFinished != VK_NULL_HANDLE) vkDestroySemaphore(app.device, app.renderFinished, nullptr);
         if (app.imageAvailable != VK_NULL_HANDLE) vkDestroySemaphore(app.device, app.imageAvailable, nullptr);
@@ -7075,6 +7650,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     initStep(CreatePipelineAxis(app), "CreatePipelineAxis");
     initStep(CreatePipelineLine3d(app), "CreatePipelineLine3d");
     initStep(CreatePipelineFXAA(app), "CreatePipelineFXAA");
+    initStep(CreatePipelineOutline(app), "CreatePipelineOutline");   // Round370
     initStep(CreateCommandResources(app), "CreateCommandResources");
     if (!initOk) {
         ShowErrorBox(g_error.c_str());

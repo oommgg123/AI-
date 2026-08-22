@@ -298,6 +298,8 @@ struct App {
         UndoOp op = UndoOp::Add;
         int index = 0;
         SceneObject obj;                 // Add/Remove 的物体快照（始终副本，不被 move 破坏）
+        std::wstring importPath;         // Round371：Add=导入时记录源路径（redo 重新导入，避免拷贝大模型）
+        std::wstring name;               // Round371：Add 记录物体名（redo 重导入后恢复）
         float oldTx = 0, oldTy = 0, oldTz = 0;   // Move：操作前位置
         float newTx = 0, newTy = 0, newTz = 0;   // Move：操作后位置
         float oldRx = 0, oldRy = 0, oldRz = 0;   // Rotate：操作前欧拉角（度）
@@ -352,6 +354,19 @@ struct App {
     VkDescriptorSetLayout fxaaDescriptorLayout = VK_NULL_HANDLE;
     VkDescriptorPool fxaaDescriptorPool = VK_NULL_HANDLE;
     VkDescriptorSet fxaaDescriptorSet = VK_NULL_HANDLE;
+    // Round370：选中物体屏幕投影描边——mask RT（选中物体白色）+ Sobel 后处理
+    VkImage outlineImage = VK_NULL_HANDLE;
+    VkDeviceMemory outlineMemory = VK_NULL_HANDLE;
+    VkImageView outlineView = VK_NULL_HANDLE;
+    VkImage outlineDepthImage = VK_NULL_HANDLE;      // mask pass 专用深度（1x，独立于主帧）
+    VkDeviceMemory outlineDepthMemory = VK_NULL_HANDLE;
+    VkImageView outlineDepthView = VK_NULL_HANDLE;
+    VkSampler outlineSampler = VK_NULL_HANDLE;
+    VkDescriptorSetLayout outlineDescriptorLayout = VK_NULL_HANDLE;
+    VkDescriptorPool outlineDescriptorPool = VK_NULL_HANDLE;
+    VkDescriptorSet outlineDescriptorSet = VK_NULL_HANDLE;
+    VkPipelineLayout outlinePipelineLayout = VK_NULL_HANDLE;
+    VkPipeline outlinePipeline = VK_NULL_HANDLE;
     VkPipelineLayout fxaaPipelineLayout = VK_NULL_HANDLE;
     VkPipeline fxaaPipeline = VK_NULL_HANDLE;
 

@@ -267,9 +267,9 @@ bool BuildSceneObject(std::vector<std::array<float, 3>>& pos,
     }
     out.wireVerts.reserve(static_cast<size_t>(npos));
     for (int i = 0; i < npos; ++i) {
-        VertexSolid v{};
-        v.pos[0] = pos[i][0]; v.pos[1] = pos[i][1]; v.pos[2] = pos[i][2];
-        out.wireVerts.push_back(v);
+        WirePos w{};
+        w.pos[0] = pos[i][0]; w.pos[1] = pos[i][1]; w.pos[2] = pos[i][2];
+        out.wireVerts.push_back(w);   // Round369：仅坐标（40B→12B 瘦身）
     }
 
     // 实体：面法线（或文件法线）逐顶点去重
@@ -972,15 +972,13 @@ bool ParseOBJ(const wchar_t* path, SceneObject& out) {
         }
     }
     if (g_importProgress >= 0) g_importProgress = 80;
-    const float wireCol[4] = {0.95f, 0.95f, 0.98f, 1.0f};
     const int npos = static_cast<int>(pos.size());
     out.wireVerts.clear();
     out.wireVerts.reserve(npos);
     for (int i = 0; i < npos; ++i) {
-        VertexSolid v{};
-        v.pos[0] = pos[i][0]; v.pos[1] = pos[i][1]; v.pos[2] = pos[i][2];
-        v.color[0] = wireCol[0]; v.color[1] = wireCol[1]; v.color[2] = wireCol[2]; v.color[3] = 1.0f;
-        out.wireVerts.push_back(v);
+        WirePos w{};   // Round369：仅坐标（线色上传时统一灰白）
+        w.pos[0] = pos[i][0]; w.pos[1] = pos[i][1]; w.pos[2] = pos[i][2];
+        out.wireVerts.push_back(w);
     }
     out.wireIndices.clear();
     out.wireIndices.reserve(edgeSet.size() * 2);

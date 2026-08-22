@@ -354,7 +354,7 @@ bool LoadTextureFromFile(const wchar_t* path, SceneObject& out) {
     int w = 0, h = 0;
     if (!DecodePngWic(bytes.data(), bytes.size(), rgba, w, h) || rgba.empty() || w <= 0 || h <= 0)
         return false;
-    out.texRgba = std::move(rgba);
+    rgba.clear();   // Round369：贴图暂未接入渲染管线（无消费方），不长期持有省内存（原 40B/像素图集级占用）
     out.texWidth = w;
     out.texHeight = h;
     return true;
@@ -396,7 +396,7 @@ bool GenerateProceduralTexture(ProceduralTexture kind, int size, SceneObject& ou
             rgba[i] = r; rgba[i + 1] = g; rgba[i + 2] = b; rgba[i + 3] = a;
         }
     }
-    out.texRgba = std::move(rgba);
+    rgba.clear();   // Round369：贴图暂未接入渲染管线（无消费方），不长期持有省内存（原 40B/像素图集级占用）
     out.texWidth = n;
     out.texHeight = n;
     return true;
@@ -448,7 +448,7 @@ void LoadObjTexture(const wchar_t* objPath, const std::string& mtlFile, SceneObj
     std::vector<uint8_t> rgba;
     int tw = 0, th = 0;
     if (!DecodePngWic(texBytes.data(), texBytes.size(), rgba, tw, th) || rgba.empty()) return;
-    out.texRgba = std::move(rgba);
+    rgba.clear();   // Round369：贴图暂未接入渲染管线（无消费方），不长期持有省内存（原 40B/像素图集级占用）
     out.texWidth = tw;
     out.texHeight = th;
     VkbLog(("[texture] 贴图已加载到内存: " + texFile + " (" + std::to_string(tw) + "x" +
@@ -535,6 +535,7 @@ struct ImportJob {
 struct ImportResult {
     bool ok = false;
     SceneObject obj;
+    std::wstring path;   // Round371：导入源路径（undo/redo 操作式——不拷贝大模型）
 };
 
 ImportResult g_importResult;
@@ -553,7 +554,13 @@ DWORD WINAPI ImportWorker(LPVOID param) {
         r.obj.name = g_isStartupImport ? L"立方体" : fname;
     }
     g_importProgress = 0;
-    r.ok = ImportModelFile(job->path.c_str(), r.obj);
+    r.path = job->path;   // Round371：记录导入路径供 undo/redo
+    try {
+        r.ok = ImportModelFile(job->path.c_str(), r.obj);
+    } catch (const std::bad_alloc&) {
+        r.ok = false;
+        g_error = "内存不足：模型过大，无法分配足够内存完成解析。";
+    }
     if (!r.ok) r.obj = SceneObject{};
     g_importProgress = r.ok ? 100 : -1;
     g_importResult = std::move(r);
@@ -573,7 +580,15 @@ void ApplyImportResult(App& app) {
         return;
     }
     g_stage = "ApplyImportResult:vkDeviceWaitIdle";
-    vkDeviceWaitIdle(app.device);
+    // Round375：设备若已丢失（驱动 TDR/超时）此裸调用会访问违规或挂死——先检后做，丢失则优雅退出导入
+    {
+        VkResult devRes = vkDeviceWaitIdle(app.device);
+        if (devRes == VK_ERROR_DEVICE_LOST) {
+            MessageBoxW(app.hwnd, L"显卡设备丢失，导入已取消。请重启软件或更新显卡驱动后重试。",
+                        L"awa - 导入失败", MB_ICONWARNING | MB_OK);
+            return;
+        }
+    }
     HCURSOR prevCursor = SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32650)));
     // Round249：追加而非清空——新导入物体不会删除已有物体（多物体场景）
     app.objects.push_back(std::move(r.obj));
@@ -590,7 +605,9 @@ void ApplyImportResult(App& app) {
         App::UndoEntry e;
         e.op = App::UndoOp::Add;
         e.index = app.selectedObject;
-        e.obj = app.objects[app.selectedObject];   // 快照（副本）
+        // Round371：操作式撤销——导入不拷贝大模型（内存翻倍主因），记录路径，redo 时重新导入
+        e.importPath = r.path;
+        e.name = app.objects[app.selectedObject].name;
         PushUndo(app, e);
     }
     g_stage = "ApplyImportResult:CreateVertexBuffer3D";

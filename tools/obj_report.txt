@@ -1,0 +1,16 @@
+OBJ_TOTAL_B 1183638
+OBJ main.cpp 530375 44.8
+OBJ mc_blocks.cpp 228180 19.3
+OBJ import_pipeline.cpp 130461 11.0
+OBJ model_import.cpp 106554 9.0
+OBJ camera.cpp 48680 4.1
+OBJ icon.rc 44572 3.8
+OBJ vulkan_loader.cpp 32651 2.8
+OBJ settings_window.cpp 19351 1.6
+OBJ ball_icons.rc 19334 1.6
+OBJ import_window.cpp 13916 1.2
+OBJ mc_map_pipeline.cpp 4094 0.3
+OBJ ui_button.cpp 2525 0.2
+OBJ gdi_util.cpp 1783 0.2
+OBJ version.rc 836 0.1
+OBJ ?? 326 0.0

@@ -929,12 +929,14 @@ void McBuildMergedMesh(const McBlockGrid& grid, const McAtlas& atlas, SceneObjec
                     out.solidIndices.push_back(base + 2);
                     out.solidIndices.push_back(base + 3);
                     // Round353：同步生成四边线框（不含 solid 三角对角线 0-2）：4 顶点 + 4 边环形
+                    // Round369：仅存坐标（线色上传时统一灰白）
                     const int wb = static_cast<int>(out.wireVerts.size());
                     for (int i = 0; i < 4; ++i) {
-                        VertexSolid vs = out.solidVerts[base + i];
-                        vs.normal[0] = 0; vs.normal[1] = 1; vs.normal[2] = 0;
-                        vs.color[0] = 1; vs.color[1] = 1; vs.color[2] = 1; vs.color[3] = 1;
-                        out.wireVerts.push_back(vs);
+                        WirePos wp{};
+                        wp.pos[0] = out.solidVerts[base + i].pos[0];
+                        wp.pos[1] = out.solidVerts[base + i].pos[1];
+                        wp.pos[2] = out.solidVerts[base + i].pos[2];
+                        out.wireVerts.push_back(wp);
                     }
                     out.wireIndices.push_back(wb + 0); out.wireIndices.push_back(wb + 1);
                     out.wireIndices.push_back(wb + 1); out.wireIndices.push_back(wb + 2);
@@ -951,11 +953,11 @@ void McBuildMergedMesh(const McBlockGrid& grid, const McAtlas& atlas, SceneObjec
     //   MCA 模式：1×1 白色（顶点色=方块色，采样白色即纯色显示）
     //   纹理模式：ss1 图集图像
     if (useMca) {
-        out.texRgba.assign({ 255, 255, 255, 255 });
+        out.texRgba.clear();   // Round369：MCA 纯色模式无需像素数据（顶点色=方块色）
         out.texWidth = 1;
         out.texHeight = 1;
     } else {
-        out.texRgba = atlas.rgba;
+        out.texRgba.clear();   // Round369：不再整张拷贝图集到每物体（atlas 局部参数，用完即弃）
         out.texWidth = atlas.width;
         out.texHeight = atlas.height;
     }

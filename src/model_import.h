@@ -18,9 +18,14 @@ struct VertexSolid {
     float color[4];
 };
 
+// Round369：线框顶点瘦身——只存坐标（12B/顶点，原 VertexSolid 40B；颜色/法线在上传 GPU 时补全）
+struct WirePos {
+    float pos[3];
+};
+
 struct SceneObject {
     std::wstring name;
-    std::vector<VertexSolid> wireVerts;
+    std::vector<WirePos> wireVerts;
     std::vector<uint32_t> wireIndices;
     std::vector<VertexSolid> featureVerts;   // Round309：特征边（棱边+边界边，Blender Freestyle 参考）——选中外框用
     std::vector<VertexSolid> solidVerts;

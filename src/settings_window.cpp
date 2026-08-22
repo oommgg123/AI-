@@ -64,6 +64,10 @@ HWND g_settingsWindow = nullptr;
 HWND g_owner = nullptr;
 HFONT g_font = nullptr;           // 微软雅黑（缓存，避免每次重绘创建）
 
+// Round372：按钮 hover 状态（-1=无，0=header，1..kMaxVisible=opt0..optN-1）——与主窗口按钮管线对齐
+int g_hoverButton = -1;
+bool g_mouseTracked = false;       // TrackMouseEvent 已发起标记（防重复发起）
+
 // 缓存的 GDI 对象（WM_CREATE 创建、WM_DESTROY 释放），避免 WM_PAINT 每次重绘反复创建/销毁 pen/brush/font
 HPEN   g_borderPen = nullptr;
 HBRUSH g_btnBrush  = nullptr;
@@ -271,12 +275,42 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         HGDIOBJ oldBrush = SelectObject(memDc, g_btnBrush);
 
         const RECT hdr = GetHeaderRect();
+        // Round372：header 按 hover/active 着色（与主窗口按钮管线对齐：normal/hover/active 边框）
+        COLORREF hdrBg = kButtonColor;
+        if (g_hoverButton == 0) {
+            // hover 提亮（×1.5 + 0.08，RGB 三通道封顶 255；与主窗口 Round363 一致）
+            int r = std::min(255, static_cast<int>(GetRValue(kButtonColor) * 1.5f + 0.08f * 255));
+            int g = std::min(255, static_cast<int>(GetGValue(kButtonColor) * 1.5f + 0.08f * 255));
+            int b = std::min(255, static_cast<int>(GetBValue(kButtonColor) * 1.5f + 0.08f * 255));
+            hdrBg = RGB(r, g, b);
+        }
+        HBRUSH hdrBrush = CreateSolidBrush(hdrBg);
+        HBRUSH hdrOldBrush = static_cast<HBRUSH>(SelectObject(memDc, hdrBrush));
+        HPEN   hdrOldPen   = static_cast<HPEN>(SelectObject(memDc, g_borderPen));
         RoundRect(memDc, hdr.left, hdr.top, hdr.right, hdr.bottom, kCornerD, kCornerD);
+        // active（列表展开）：黄边（1.5px，模拟主窗口 active 状态）
+        if (g_listOpen) {
+            const HPEN yb = CreatePen(PS_SOLID, 2, RGB(255, 215, 26));
+            HPEN ybOld = static_cast<HPEN>(SelectObject(memDc, yb));
+            HBRUSH nb = static_cast<HBRUSH>(GetStockObject(NULL_BRUSH));
+            HBRUSH nbOld = static_cast<HBRUSH>(SelectObject(memDc, nb));
+            RoundRect(memDc, hdr.left, hdr.top, hdr.right, hdr.bottom, kCornerD, kCornerD);
+            SelectObject(memDc, ybOld);
+            SelectObject(memDc, nbOld);
+            DeleteObject(yb);
+            SelectObject(memDc, hdrBrush);
+        }
+        SelectObject(memDc, hdrOldBrush);
+        SelectObject(memDc, hdrOldPen);
+        DeleteObject(hdrBrush);
         RECT textRect = hdr;
         textRect.left += kTextPad;
         SetTextColor(memDc, kTextSel);
         DrawTextW(memDc, kAANames[g_selectedAaMode], -1, &textRect,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        // 恢复后续代码使用的 brush/pen（原顺序：borderPen+btnBrush）
+        SelectObject(memDc, g_borderPen);
+        SelectObject(memDc, g_btnBrush);
         {
             const int acx = hdr.right - 22;
             const int acy = (hdr.top + hdr.bottom) / 2;
@@ -516,7 +550,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     // 系统擦背景（hbrBackground）会产生黑闪——直接返回 1 跳过擦除，闪烁彻底消除
     case WM_ERASEBKGND:
         return 1;
-    case WM_MOUSEMOVE:
+    case WM_MOUSEMOVE: {
         if (g_scrollDragging) {
             // 滚动条 thumb 拖动：按鼠标位移换算滚动偏移
             const RECT t = GetScrollTrackRect();
@@ -541,6 +575,40 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             const int x = static_cast<short>(LOWORD(lParam));
             UpdateSensitivityFromX(x);
             InvalidateRect(hwnd, nullptr, FALSE);  // FALSE=不擦背景，全量重绘交给 WM_PAINT 双缓冲
+        }
+        // Round372：按钮 hover 检测——header + 列表可见行；变化时 InvalidateRect 触发重绘
+        const POINT pt{ static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam)) };
+        int newHover = -1;
+        const RECT hdr = GetHeaderRect();
+        if (PtInRect(&hdr, pt)) newHover = 0;
+        else if (g_listOpen) {
+            for (int row = 0; row < kMaxVisible; ++row) {
+                const int opt = g_scrollOffset + row;
+                if (opt >= kAACount) break;
+                const RECT r = GetOptionRect(row);
+                if (PtInRect(&r, pt)) { newHover = row + 1; break; }
+            }
+        }
+        if (newHover != g_hoverButton) {
+            g_hoverButton = newHover;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        // 首次收到 WM_MOUSEMOVE 时请求离开通知——鼠标移出窗口重置 hover
+        if (!g_mouseTracked) {
+            TRACKMOUSEEVENT tme{};
+            tme.cbSize = sizeof(tme);
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = hwnd;
+            TrackMouseEvent(&tme);
+            g_mouseTracked = true;
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:   // Round372：鼠标离开窗口——重置 hover
+        g_mouseTracked = false;
+        if (g_hoverButton != -1) {
+            g_hoverButton = -1;
+            InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
     case WM_TIMER:
