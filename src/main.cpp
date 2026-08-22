@@ -597,19 +597,53 @@ Layout ComputeLayout(const App& app) {
     return l;
 }
 
-// Round358：命中可拖拽分隔线（0=顶栏下缘 1=左栏右缘 2=右栏左缘 3=底栏上缘；-1=无），容差 ±5px
-static int HitResizeDivider(const App& app, float mx, float my) {
+// Round360：分隔线拖拽图标（药丸把手）矩形；div 0=顶栏下缘 1=左栏右缘 2=右栏左缘 3=底栏上缘
+static bool DividerIconRect(const App& app, int div, VkRect2D& out) {
     const Layout lay = ComputeLayout(app);
-    constexpr float kTol = 5.0f;
-    const float topY    = static_cast<float>(lay.top.extent.height);
-    const float bottomY = static_cast<float>(lay.bottom.offset.y);
-    const float leftX   = static_cast<float>(lay.left.extent.width);
-    const float rightX  = static_cast<float>(lay.right.offset.x);
-    if (std::fabs(my - topY) <= kTol) return 0;        // 顶栏下缘（全宽）
-    if (std::fabs(my - bottomY) <= kTol) return 3;     // 底栏上缘（全宽）
-    if (my >= topY && my <= bottomY) {
-        if (std::fabs(mx - leftX) <= kTol) return 1;   // 左栏右缘（垂直）
-        if (std::fabs(mx - rightX) <= kTol) return 2;  // 右栏左缘（垂直）
+    constexpr int32_t kPill = 30;    // 把手长度
+    constexpr int32_t kThick = 10;   // 把手厚度
+    switch (div) {
+    case 0: {   // 顶栏下缘（水平）：水平把手，全宽居中
+        const int32_t y = static_cast<int32_t>(lay.top.extent.height);
+        const int32_t cx = static_cast<int32_t>(app.swapchainExtent.width / 2);
+        out = {{cx - kPill / 2, y - kThick / 2}, {kPill, kThick}};
+        return true;
+    }
+    case 3: {   // 底栏上缘（水平）
+        const int32_t y = static_cast<int32_t>(lay.bottom.offset.y);
+        const int32_t cx = static_cast<int32_t>(app.swapchainExtent.width / 2);
+        out = {{cx - kPill / 2, y - kThick / 2}, {kPill, kThick}};
+        return true;
+    }
+    case 1: {   // 左栏右缘（垂直）
+        const int32_t x = static_cast<int32_t>(lay.left.extent.width);
+        const int32_t cy = static_cast<int32_t>(lay.left.offset.y +
+                            static_cast<int32_t>(lay.left.extent.height) / 2);
+        out = {{x - kThick / 2, cy - kPill / 2}, {kThick, kPill}};
+        return true;
+    }
+    case 2: {   // 右栏左缘（垂直）
+        const int32_t x = static_cast<int32_t>(lay.right.offset.x);
+        const int32_t cy = static_cast<int32_t>(lay.right.offset.y +
+                            static_cast<int32_t>(lay.right.extent.height) / 2);
+        out = {{x - kThick / 2, cy - kPill / 2}, {kThick, kPill}};
+        return true;
+    }
+    }
+    return false;
+}
+
+// Round360：命中分隔线**拖拽图标**（药丸把手 ±8px 容差）——不再整条线 ±5px（目标更明确易拖）
+static int HitResizeDivider(const App& app, float mx, float my) {
+    constexpr int32_t kPad = 8;
+    for (int div = 0; div < 4; ++div) {
+        VkRect2D r;
+        if (!DividerIconRect(app, div, r)) continue;
+        if (mx >= static_cast<float>(r.offset.x - kPad) &&
+            mx <  static_cast<float>(r.offset.x + static_cast<int32_t>(r.extent.width) + kPad) &&
+            my >= static_cast<float>(r.offset.y - kPad) &&
+            my <  static_cast<float>(r.offset.y + static_cast<int32_t>(r.extent.height) + kPad))
+            return div;
     }
     return -1;
 }
@@ -2054,6 +2088,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (app->resizeDrag >= 0) {
                 app->resizeDrag = -1;
                 ReleaseCapture();
+                // Round360：拖拽结束 → 面板尺寸写入 awa_settings.txt（下次启动恢复）
+                SaveSettingInt("panel_top_h", static_cast<int>(app->panelTopH));
+                SaveSettingInt("panel_left_w", static_cast<int>(app->panelLeftW));
+                SaveSettingInt("panel_right_w", static_cast<int>(app->panelRightW));
+                SaveSettingInt("panel_bottom_h", static_cast<int>(app->panelBottomH));
             }
             // 三向标/中心环拖拽结束（松开即提交；位置有变化才记录撤销项）
             if (app->gizmoDragging) {
@@ -5705,6 +5744,51 @@ void DrawLogicBar(App& app, const Layout& layout) {
              kBorderColor, 0.0f);
     for (uint32_t i = 0; i < panelCount; ++i) DrawPanel(app, panels[i]);
 
+    // Round360：分隔线拖拽图标——药丸把手 + 双箭头（方向随分隔线：水平线 ↕ / 垂直线 ↔），悬停变亮（黄）
+    {
+        const int32_t topY = static_cast<int32_t>(layout.top.extent.height);
+        const int32_t bottomY = static_cast<int32_t>(layout.bottom.offset.y);
+        const int32_t leftX = static_cast<int32_t>(layout.left.extent.width);
+        const int32_t rightX = static_cast<int32_t>(layout.right.offset.x);
+        const VkClearColorValue kColIdle = {{0.52f, 0.52f, 0.57f, 1.0f}};   // 未悬停
+        const VkClearColorValue kColHot  = {{0.95f, 0.88f, 0.30f, 1.0f}};   // 悬停（黄）
+        const VkRect2D scissorAll{{0, 0}, {w, h}};
+        const auto hover = [&](const VkRect2D& r) -> bool {
+            return app.mouseX >= static_cast<float>(r.offset.x) &&
+                   app.mouseX <  static_cast<float>(r.offset.x + static_cast<int32_t>(r.extent.width)) &&
+                   app.mouseY >= static_cast<float>(r.offset.y) &&
+                   app.mouseY <  static_cast<float>(r.offset.y + static_cast<int32_t>(r.extent.height));
+        };
+        // 水平分隔线（0 顶栏下缘 / 3 底栏上缘）：水平药丸 + 上下箭头
+        for (int div : {0, 3}) {
+            VkRect2D r;
+            if (!DividerIconRect(app, div, r) || r.extent.width == 0) continue;
+            const VkClearColorValue& col = hover(r) ? kColHot : kColIdle;
+            DrawPanel(app, {r, col, static_cast<float>(r.extent.height) / 2.0f});
+            const float fx = static_cast<float>(r.offset.x + static_cast<int32_t>(r.extent.width) / 2);
+            const float fy = static_cast<float>(r.offset.y + static_cast<int32_t>(r.extent.height) / 2);
+            const float s = 5.0f;
+            DrawLine(app, scissorAll, fx - s, fy - s, fx, fy - s - 5.0f, col, 1.0f);   // 上箭头
+            DrawLine(app, scissorAll, fx + s, fy - s, fx, fy - s - 5.0f, col, 1.0f);
+            DrawLine(app, scissorAll, fx - s, fy + s, fx, fy + s + 5.0f, col, 1.0f);   // 下箭头
+            DrawLine(app, scissorAll, fx + s, fy + s, fx, fy + s + 5.0f, col, 1.0f);
+        }
+        // 垂直分隔线（1 左栏右缘 / 2 右栏左缘）：垂直药丸 + 左右箭头
+        for (int div : {1, 2}) {
+            VkRect2D r;
+            if (!DividerIconRect(app, div, r) || r.extent.height == 0) continue;
+            const VkClearColorValue& col = hover(r) ? kColHot : kColIdle;
+            DrawPanel(app, {r, col, static_cast<float>(r.extent.width) / 2.0f});
+            const float fx = static_cast<float>(r.offset.x + static_cast<int32_t>(r.extent.width) / 2);
+            const float fy = static_cast<float>(r.offset.y + static_cast<int32_t>(r.extent.height) / 2);
+            const float s = 5.0f;
+            DrawLine(app, scissorAll, fx - s, fy - s, fx - s - 5.0f, fy, col, 1.0f);   // 左箭头
+            DrawLine(app, scissorAll, fx - s, fy + s, fx - s - 5.0f, fy, col, 1.0f);
+            DrawLine(app, scissorAll, fx + s, fy - s, fx + s + 5.0f, fy, col, 1.0f);   // 右箭头
+            DrawLine(app, scissorAll, fx + s, fy + s, fx + s + 5.0f, fy, col, 1.0f);
+        }
+    }
+
     for (size_t bi = 0; bi < app.buttons.size(); ++bi) {
         const UiButton& btn = app.buttons[bi];
         VkClearColorValue fill{};
@@ -6845,6 +6929,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     } else {
         g_mouseSensitivity = 50;
         app.camera.orbitSensitivity = SensToFactor(50);
+    }
+
+    // Round360：面板尺寸持久化（awa_settings.txt，仅当 >= 最小默认值才采纳）
+    {
+        const int t = LoadSettingInt("panel_top_h", -1);
+        if (t >= static_cast<int>(kTopBarHeight))    app.panelTopH = static_cast<uint32_t>(t);
+        const int l = LoadSettingInt("panel_left_w", -1);
+        if (l >= static_cast<int>(kSideBarWidth))    app.panelLeftW = static_cast<uint32_t>(l);
+        const int rr = LoadSettingInt("panel_right_w", -1);
+        if (rr >= static_cast<int>(kSideBarWidth))   app.panelRightW = static_cast<uint32_t>(rr);
+        const int b = LoadSettingInt("panel_bottom_h", -1);
+        if (b >= static_cast<int>(kBottomBarHeight)) app.panelBottomH = static_cast<uint32_t>(b);
     }
 
     // 初始化失败统一处理：先写日志（exe 同目录 awa.log 定位具体失败点）再弹窗
