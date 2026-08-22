@@ -4985,43 +4985,13 @@ static void FormatScaleLen(float len, char* buf, int n) {
     else                    std::snprintf(buf, static_cast<size_t>(n), "%.2f", len);
 }
 
-// 七段数码管绘制单个数字（在 scissor 矩形内，原点 (x,y)，宽 W 高 H）
-static void DrawSevenSeg(App& app, VkRect2D scissor, int d, float x, float y, float W, float H,
-                        VkClearColorValue col) {
-    if (d < 0 || d > 9) return;
-    // 段位：a(上) b(右上) c(右下) d(下) e(左下) f(左上) g(中)
-    static const bool seg[10][7] = {
-        {1,1,1,1,1,1,0}, // 0
-        {0,1,1,0,0,0,0}, // 1
-        {1,1,0,1,1,0,1}, // 2
-        {1,1,1,1,0,0,1}, // 3
-        {0,1,1,0,0,1,1}, // 4
-        {1,0,1,1,0,1,1}, // 5
-        {1,0,1,1,1,1,1}, // 6
-        {1,1,1,0,0,0,0}, // 7
-        {1,1,1,1,1,1,1}, // 8
-        {1,1,1,1,0,1,1}, // 9
-    };
-    const float midY = y + H * 0.5f;
-    const auto segLine = [&](float ax, float ay, float bx, float by) {
-        DrawLine(app, scissor, ax, ay, bx, by, col, 0.9f);   // 笔画细（Round240：1.2→0.9）
-    };
-    if (seg[d][0]) segLine(x,        y,        x + W,    y);        // a
-    if (seg[d][1]) segLine(x + W,    y,        x + W,    midY);     // b
-    if (seg[d][2]) segLine(x + W,    midY,     x + W,    y + H);    // c
-    if (seg[d][3]) segLine(x,        y + H,    x + W,    y + H);    // d
-    if (seg[d][4]) segLine(x,        midY,     x,        y + H);    // e
-    if (seg[d][5]) segLine(x,        y,        x,        midY);     // f
-    if (seg[d][6]) segLine(x,        midY,     x + W,    midY);     // g
-}
-
 // Round331：缩放条数字用 RasterizeText+UploadLabelRgba（系统字体）——前向声明（定义在其后）
 static void UploadLabelRgba(App& app, App::LabelTexture& lt,
                             const std::vector<uint8_t>& rgba, int w, int h);
 
 // 比例尺（Round256）：**固定长条 + 移动竖线**——横条长度固定，竖线按相机距离
 // （对数映射，范围 0.3~10000 与相机 zoom clamp 一致）左右移动指示当前缩放；
-// 条上方居中显示当前距离数值（七段数码，窄字 + 明显字间距）
+// 条上方居中显示当前距离数值（RasterizeText 系统字体，窄字 + 明显字间距）
 static void DrawScaleBar(App& app, const Layout& layout) {
     // Round328：淡入淡出动画（navZoomAlpha 驱动）——默认隐藏；滚轮缩放 0.1s 淡入、
     // 停止 0.5s 淡出、与罗盘/距离条 0.1s 互斥替换（UpdateNavHud 精确时间规则）
