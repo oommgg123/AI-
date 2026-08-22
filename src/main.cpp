@@ -5730,14 +5730,37 @@ void DrawLogicBar(App& app, const Layout& layout) {
              kBorderColor, 0.0f);
     for (uint32_t i = 0; i < panelCount; ++i) DrawPanel(app, panels[i]);
 
-    // Round362：顶栏按钮垂直居中（高度不变，随顶栏高度变化；默认 36 时 y=4 与旧一致）
+    // Round363：鼠标移入栏位 → 该栏位高亮（覆盖面板底色，圆角随栏位；按钮/列表等内容随后绘制不受影响）
+    {
+        const float mx = app.mouseX, my = app.mouseY;
+        const auto inRect = [&](const VkRect2D& r) -> bool {
+            return mx >= static_cast<float>(r.offset.x) &&
+                   mx <  static_cast<float>(r.offset.x + static_cast<int32_t>(r.extent.width)) &&
+                   my >= static_cast<float>(r.offset.y) &&
+                   my <  static_cast<float>(r.offset.y + static_cast<int32_t>(r.extent.height));
+        };
+        VkRect2D hr{};
+        float hrad = 0.0f;
+        if      (inRect(layout.top))    { hr = layout.top;    hrad = 0.0f; }
+        else if (inRect(layout.left))   { hr = layout.left;   hrad = kCornerRadius; }
+        else if (inRect(layout.right))  { hr = layout.right;  hrad = 0.0f; }
+        else if (inRect(layout.bottom)) { hr = layout.bottom; hrad = kCornerRadius; }
+        if (hr.extent.width > 0 && hr.extent.height > 0) {
+            VkClearColorValue hl = kPanelColor;
+            for (int c = 0; c < 3; ++c) hl.float32[c] = std::min(1.0f, hl.float32[c] * 1.22f + 0.035f);
+            DrawPanel(app, {hr, hl, hrad});
+        }
+    }
+
+    // Round363：顶栏按钮高度随栏位变化（上下各留 4px），图标/字符按按钮中心自动居中（图标上限 48px）
     {
         const int32_t topH = static_cast<int32_t>(layout.top.extent.height);
         if (topH > 0) {
             for (auto& b : app.buttons) {
                 if (b.rect.offset.y >= static_cast<int32_t>(kTopBarHeight)) continue;   // 仅顶栏按钮
-                const int32_t bh = static_cast<int32_t>(b.rect.extent.height);
+                const int32_t bh = std::max(20, topH - 8);   // 上下各留 4px；最小 20
                 b.rect.offset.y = static_cast<int32_t>((topH - bh) / 2);
+                b.rect.extent.height = static_cast<uint32_t>(bh);
             }
         }
     }
@@ -5759,7 +5782,7 @@ void DrawLogicBar(App& app, const Layout& layout) {
         vkCmdBindPipeline(app.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.pipeline);
         vkCmdBindVertexBuffers(app.commandBuffer, 0, 1, &app.vertexBuffer, &vertexOffset);
         DrawPanel(app, {btn.rect, fill, btn.radius, border});
-        const float iconSize = static_cast<float>(btn.rect.extent.height) - 6.0f;
+        const float iconSize = std::min(static_cast<float>(btn.rect.extent.height) - 6.0f, 48.0f);   // Round363：图标上限 48px
         const float cx = static_cast<float>(btn.rect.offset.x) + btn.rect.extent.width * 0.5f;
         const float cy = static_cast<float>(btn.rect.offset.y) + btn.rect.extent.height * 0.5f;
         const VkRect2D iconRect{
@@ -5934,14 +5957,21 @@ void DrawLogicBar(App& app, const Layout& layout) {
         DrawPanel(app, {{{px - kObjPanelPad, py - kObjPanelPad},
                          {static_cast<uint32_t>(pw + 2 * kObjPanelPad), static_cast<uint32_t>(ph)}},
                         panelFill, 0.0f, whiteBorder, 1.0f});   // Round346：模型列表面板无圆角
-        // 每行背景（Round258：列表风格——所有行颜色加深，选中行用主题选中色；文字 alpha 混合叠加）
-        const VkClearColorValue rowBg = {{0.235f, 0.235f, 0.255f, 1.0f}};   // 比面板底色稍深
+        // Round363：物体栏行级按钮化——每行按按钮渲染（按钮主题色 normal + 悬停提亮 + 选中高亮，圆角行）
         const int nRows = static_cast<int>(app.objects.size());
         for (int i = 0; i < nRows; ++i) {
             const VkRect2D rowRect{{px, py + i * kObjPanelRowH},
                                    {static_cast<uint32_t>(pw), static_cast<uint32_t>(kObjPanelRowH)}};
-            const VkClearColorValue& rc = (i == app.selectedObject) ? selColor : rowBg;
-            DrawPanel(app, {rowRect, rc, 0.0f, rc, 0.0f});
+            const bool hovered =
+                app.mouseX >= static_cast<float>(rowRect.offset.x) &&
+                app.mouseX <  static_cast<float>(rowRect.offset.x + static_cast<int32_t>(rowRect.extent.width)) &&
+                app.mouseY >= static_cast<float>(rowRect.offset.y) &&
+                app.mouseY <  static_cast<float>(rowRect.offset.y + static_cast<int32_t>(rowRect.extent.height));
+            VkClearColorValue rc;
+            for (int c = 0; c < 4; ++c) rc.float32[c] = app.buttonTheme.normal[c];
+            if (i == app.selectedObject) rc = selColor;   // 选中高亮（主题选中色）
+            else if (hovered) for (int c = 0; c < 3; ++c) rc.float32[c] = std::min(1.0f, app.buttonTheme.normal[c] * 1.5f + 0.08f);   // 悬停提亮
+            DrawPanel(app, {rowRect, rc, 4.0f, rc, 0.0f});   // 圆角行（4px）
         }
         // 全部物体名字列表（DrawIcon 内部切换 textPipeline；透明底白字，混合显示）
         if (app.objNameLabel.set != VK_NULL_HANDLE && app.objNameLabel.w > 0) {
