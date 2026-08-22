@@ -2398,10 +2398,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     }
                 }
                 if (f > 0.0f) {
-                    if (axis == 3) { so.sx = app->gizmoStartSx * f; so.sy = app->gizmoStartSy * f; so.sz = app->gizmoStartSz * f; }
-                    else if (axis == 0) so.sx = app->gizmoStartSx * f;
-                    else if (axis == 1) so.sy = app->gizmoStartSy * f;
-                    else if (axis == 2) so.sz = app->gizmoStartSz * f;
+                    if (axis == 3) {   // 中心方块：等比（三轴同乘，与旋转无关）
+                        so.sx = app->gizmoStartSx * f; so.sy = app->gizmoStartSy * f; so.sz = app->gizmoStartSz * f;
+                    } else if (axis >= 0 && axis <= 2) {
+                        // Round361：旋转过（斜着）的物体——世界轴缩放**按公式分配**：
+                        // 世界轴方向投影到本地坐标 v = R^T·d（R 列 = 本地轴在世界方向），
+                        // 按 |v| 分量把缩放因子 f 分配到 sx/sy/sz（sx'=sx·(1+(f-1)|vx|)）。
+                        // 未旋转时 v=(1,0,0) 等 → 退化为单轴，与旧行为一致。
+                        float R[16];
+                        BuildRotFromEuler(so.rx, so.ry, so.rz, R);
+                        const float vx = R[axis], vy = R[4 + axis], vz = R[8 + axis];
+                        const float k = f - 1.0f;
+                        so.sx = app->gizmoStartSx * (1.0f + k * std::fabs(vx));
+                        so.sy = app->gizmoStartSy * (1.0f + k * std::fabs(vy));
+                        so.sz = app->gizmoStartSz * (1.0f + k * std::fabs(vz));
+                    }
                 }
                 if (std::fabs(f - 1.0f) > 0.002f) app->mouseDragged = true;
                 app->camera.lastX = x;
