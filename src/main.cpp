@@ -83,8 +83,7 @@ constexpr uint32_t kWindowWidth = 800;
 constexpr uint32_t kWindowHeight = 600;
 
 // ---- 界面布局 ----
-constexpr uint32_t kTopBarHeight = 36;
-constexpr uint32_t kSideBarWidth = 160;
+// Round358：kTopBarHeight / kSideBarWidth / kBottomBarHeight 已移至 app.h（App 默认值 + 拖拽最小限制共用）
 constexpr float kLineWidth = 1.0f;
 // 右侧物体列表（Round252：Blender 风格多物体编辑栏）行高 / 面板内边距（绘制与点击命中共用）
 constexpr int kObjPanelRowH = 22;
@@ -570,25 +569,49 @@ struct Layout {
     VkRect2D top;
     VkRect2D left;
     VkRect2D right;
+    VkRect2D bottom;    // Round358：底部面板（默认高 150）
     VkRect2D viewport;
 };
 
-Layout ComputeLayout(const VkExtent2D& extent) {
-    const uint32_t w = extent.width;
-    const uint32_t h = extent.height;
-    const uint32_t bodyTop = kTopBarHeight;
-    const uint32_t bodyH = h > bodyTop ? h - bodyTop : 0;
-    const uint32_t sideW = w > kSideBarWidth ? kSideBarWidth : 0;
-    const uint32_t centerW = w > 2 * kSideBarWidth ? w - 2 * kSideBarWidth : 0;
+// Round358：布局单一来源——面板尺寸取自 App 可调字段（默认=最小，拖分隔线调整），视口吃剩余空间
+Layout ComputeLayout(const App& app) {
+    const uint32_t w = app.swapchainExtent.width;
+    const uint32_t h = app.swapchainExtent.height;
+    const uint32_t topH    = (h > app.panelTopH)    ? app.panelTopH    : 0;
+    const uint32_t bottomH = (h > app.panelBottomH) ? app.panelBottomH : 0;
+    const uint32_t leftW   = (w > app.panelLeftW)   ? app.panelLeftW   : 0;
+    const uint32_t rightW  = (w > app.panelRightW)  ? app.panelRightW  : 0;
+    const uint32_t bodyTop = topH;
+    const uint32_t bodyBottom = (h >= bottomH) ? h - bottomH : 0;
+    const uint32_t bodyH  = (bodyBottom > bodyTop) ? bodyBottom - bodyTop : 0;
+    const uint32_t centerW = (w >= leftW + rightW) ? w - leftW - rightW : 0;
 
     Layout l{};
-    l.top      = {{0, 0}, {w, kTopBarHeight}};
-    l.left     = {{0, static_cast<int32_t>(bodyTop)}, {sideW, bodyH}};
-    l.right    = {{static_cast<int32_t>(w - sideW), static_cast<int32_t>(bodyTop)},
-                  {sideW, bodyH}};
-    l.viewport = {{static_cast<int32_t>(kSideBarWidth), static_cast<int32_t>(bodyTop)},
+    l.top      = {{0, 0}, {w, topH}};
+    l.left     = {{0, static_cast<int32_t>(bodyTop)}, {leftW, bodyH}};
+    l.right    = {{static_cast<int32_t>(w - rightW), static_cast<int32_t>(bodyTop)},
+                  {rightW, bodyH}};
+    l.bottom   = {{0, static_cast<int32_t>(h - bottomH)}, {w, bottomH}};
+    l.viewport = {{static_cast<int32_t>(leftW), static_cast<int32_t>(bodyTop)},
                   {centerW, bodyH}};
     return l;
+}
+
+// Round358：命中可拖拽分隔线（0=顶栏下缘 1=左栏右缘 2=右栏左缘 3=底栏上缘；-1=无），容差 ±5px
+static int HitResizeDivider(const App& app, float mx, float my) {
+    const Layout lay = ComputeLayout(app);
+    constexpr float kTol = 5.0f;
+    const float topY    = static_cast<float>(lay.top.extent.height);
+    const float bottomY = static_cast<float>(lay.bottom.offset.y);
+    const float leftX   = static_cast<float>(lay.left.extent.width);
+    const float rightX  = static_cast<float>(lay.right.offset.x);
+    if (std::fabs(my - topY) <= kTol) return 0;        // 顶栏下缘（全宽）
+    if (std::fabs(my - bottomY) <= kTol) return 3;     // 底栏上缘（全宽）
+    if (my >= topY && my <= bottomY) {
+        if (std::fabs(mx - leftX) <= kTol) return 1;   // 左栏右缘（垂直）
+        if (std::fabs(mx - rightX) <= kTol) return 2;  // 右栏左缘（垂直）
+    }
+    return -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -630,7 +653,7 @@ static float RayAABB(const float* o, const float* d,
 
 // 屏幕坐标（窗口像素）→ 拾取射线（o=相机位置，d=单位方向）；3D 视口外返回 false
 static bool BuildViewRay(App& app, float mx, float my, float o[3], float d[3]) {
-    const Layout lay = ComputeLayout(app.swapchainExtent);
+    const Layout lay = ComputeLayout(app);
     const VkRect2D& vp = lay.viewport;
     if (vp.extent.width <= 0 || vp.extent.height <= 0) return false;
     const float ndcX = (mx - static_cast<float>(vp.offset.x)) / static_cast<float>(vp.extent.width) * 2.0f - 1.0f;
@@ -769,7 +792,7 @@ static int PickGizmoAxisAt(App& app, float mx, float my) {
     const SceneObject& o = app.objects[app.selectedObject];
     float p[3];
     GizmoPivot(o, p);
-    const Layout lay = ComputeLayout(app.swapchainExtent);
+    const Layout lay = ComputeLayout(app);
     const VkRect2D& vp = lay.viewport;
     if (vp.extent.width <= 0 || vp.extent.height <= 0) return -1;
     const float len = GizmoAxisLen(app, p, vp);
@@ -811,7 +834,7 @@ static bool HitGizmoRingAt(App& app, float mx, float my) {
     const SceneObject& o = app.objects[app.selectedObject];
     float p[3];
     GizmoPivot(o, p);
-    const Layout lay = ComputeLayout(app.swapchainExtent);
+    const Layout lay = ComputeLayout(app);
     const VkRect2D& vp = lay.viewport;
     if (vp.extent.width <= 0 || vp.extent.height <= 0) return false;
     float view[16], proj[16], mvp[16];
@@ -1294,7 +1317,7 @@ static int PickRotateGizmoAt(App& app, float mx, float my) {
     const SceneObject& o = app.objects[app.selectedObject];
     float p[3];
     GizmoPivot(o, p);
-    const Layout lay = ComputeLayout(app.swapchainExtent);
+    const Layout lay = ComputeLayout(app);
     const VkRect2D& vp = lay.viewport;
     if (vp.extent.width <= 0 || vp.extent.height <= 0) return -1;
     const float len = GizmoAxisLen(app, p, vp);
@@ -1365,7 +1388,7 @@ static int PickScaleGizmoAt(App& app, float mx, float my) {
     const SceneObject& o = app.objects[app.selectedObject];
     float p[3];
     GizmoPivot(o, p);
-    const Layout lay = ComputeLayout(app.swapchainExtent);
+    const Layout lay = ComputeLayout(app);
     const VkRect2D& vp = lay.viewport;
     if (vp.extent.width <= 0 || vp.extent.height <= 0) return -1;
     const float len = GizmoAxisLen(app, p, vp) * 0.72f;
@@ -1601,6 +1624,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
         }
         return 0;
+    case WM_SETCURSOR:   // Round358：悬停可拖拽分隔线/拖拽中 -> 手型光标（IDC_HAND）
+        if (App* app = GetApp(hwnd)) {
+            POINT pt{};
+            GetCursorPos(&pt);
+            ScreenToClient(hwnd, &pt);
+            if (app->resizeDrag >= 0 ||
+                HitResizeDivider(*app, static_cast<float>(pt.x), static_cast<float>(pt.y)) >= 0) {
+                SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32649)));   // 32649 = IDC_HAND（工程无 UNICODE，宏展开为 char* 需用 W 版）
+                return TRUE;
+            }
+        }
+        break;
     case WM_KEYDOWN:
         if (App* app = GetApp(hwnd)) {
             const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
@@ -1662,6 +1697,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     return 0;
                 }
             }
+            // Round358：分隔线拖拽开始（优先于按钮/物体拾取；命中 4 条可缩放边缘）
+            const int divider = HitResizeDivider(*app, mx, my);
+            if (divider >= 0) {
+                app->resizeDrag = divider;
+                app->resizeStartMouse = (divider == 1 || divider == 2) ? mx : my;
+                app->resizeStartVal = (divider == 0) ? app->panelTopH :
+                                      (divider == 1) ? app->panelLeftW :
+                                      (divider == 2) ? app->panelRightW : app->panelBottomH;
+                app->mouseDragged = true;
+                SetCapture(hwnd);
+                return 0;
+            }
             int hit = -1;
             for (size_t i = 0; i < app->buttons.size(); ++i) {
                 if (app->buttons[i].machine.OnMouseDown(PointInButton(app->buttons[i], mx, my))) {
@@ -1674,14 +1721,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (app->buttons[hit].icon != 1) app->menuOpen = false;
             } else {
                 app->menuOpen = false;
-                // 右侧物体列表点击选中（Round252：Blender 风格多物体编辑栏）
-                if (app->swapchainExtent.width >= kSideBarWidth + 40 &&
-                    app->swapchainExtent.height >= 560) {
-                    const int px = static_cast<int>(app->swapchainExtent.width) -
-                                   static_cast<int>(kSideBarWidth) + kObjPanelPad;
-                    const int py = static_cast<int>(kTopBarHeight) + kObjPanelPad;
-                    const int pw = static_cast<int>(kSideBarWidth) - 2 * kObjPanelPad;
-                    const int ph = 500;
+                // 右侧物体列表点击选中（Round252：Blender 风格多物体编辑栏；Round358：跟随可调右栏布局）
+                const Layout layR = ComputeLayout(*app);
+                if (layR.right.extent.width >= 40 && layR.right.extent.height >= 100) {
+                    const int px = layR.right.offset.x + kObjPanelPad;
+                    const int py = layR.right.offset.y + kObjPanelPad;
+                    const int pw = static_cast<int>(layR.right.extent.width) - 2 * kObjPanelPad;
+                    const int ph = static_cast<int>(layR.right.extent.height) - 2 * kObjPanelPad;
                     if (mx >= px && mx < px + pw && my >= py && my < py + ph) {
                         const int row = static_cast<int>((my - py) / kObjPanelRowH);
                         if (row >= 0 && row < static_cast<int>(app->objects.size())) {
@@ -1720,7 +1766,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         app->pressX = mx; app->pressY = my;
                         // Round304：记录枢轴的屏幕投影（旋转角度基准，沿环切向拖拽）
                         {
-                            const Layout lay2 = ComputeLayout(app->swapchainExtent);
+                            const Layout lay2 = ComputeLayout(*app);
                             const VkRect2D& vp2 = lay2.viewport;
                             float view[16], proj[16], mvp[16];
                             app->camera.ViewMatrix(view);
@@ -1806,6 +1852,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_LBUTTONUP:
         if (App* app = GetApp(hwnd)) {
+            // Round358：分隔线拖拽结束（尺寸已实时更新）
+            if (app->resizeDrag >= 0) {
+                app->resizeDrag = -1;
+                ReleaseCapture();
+            }
             // 三向标/中心环拖拽结束（松开即提交；位置有变化才记录撤销项）
             if (app->gizmoDragging) {
                 app->gizmoDragging = false;
@@ -1897,7 +1948,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (!app->mouseDragged && app->pressedButton < 0 && app->pressedMenuItem < 0) {
                 const float ux = MouseX(lParam);
                 const float uy = MouseY(lParam);
-                const Layout lay = ComputeLayout(app->swapchainExtent);
+                const Layout lay = ComputeLayout(*app);
                 const VkRect2D& vp = lay.viewport;
                 if (ux >= static_cast<float>(vp.offset.x) &&
                     ux <  static_cast<float>(vp.offset.x + vp.extent.width) &&
@@ -1947,7 +1998,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (x1 - x0 >= 4.0f && y1 - y0 >= 4.0f) {
                     // 框选：物体中心（世界平移位置）投影到屏幕，在框内 → 选中（主操作对象=最后一个）
                     app->multiSel.clear();
-                    const Layout lay = ComputeLayout(app->swapchainExtent);
+                    const Layout lay = ComputeLayout(*app);
                     const VkRect2D& vp = lay.viewport;
                     float view[16], proj[16], mvp[16];
                     app->camera.ViewMatrix(view);
@@ -2003,6 +2054,29 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             const float y = MouseY(lParam);
             app->mouseX = x;              // 悬停高亮（中心环）用
             app->mouseY = y;
+            // Round358：分隔线拖拽——实时调整面板尺寸（min=默认值，max 保证视口 >=60px）
+            if (app->resizeDrag >= 0) {
+                const float m = (app->resizeDrag == 1 || app->resizeDrag == 2) ? x : y;
+                const int64_t delta = static_cast<int64_t>(m - app->resizeStartMouse);
+                uint32_t* val = (app->resizeDrag == 0) ? &app->panelTopH :
+                                (app->resizeDrag == 1) ? &app->panelLeftW :
+                                (app->resizeDrag == 2) ? &app->panelRightW : &app->panelBottomH;
+                const uint32_t minVal = (app->resizeDrag == 0) ? kTopBarHeight :
+                                        (app->resizeDrag == 1 || app->resizeDrag == 2) ? kSideBarWidth :
+                                                                                         kBottomBarHeight;
+                const uint32_t W = app->swapchainExtent.width;
+                const uint32_t H = app->swapchainExtent.height;
+                constexpr uint32_t kViewportMin = 60;   // 视口最小保留
+                uint32_t maxVal = minVal;
+                if (app->resizeDrag == 0)      maxVal = (H > app->panelBottomH + kViewportMin) ? H - app->panelBottomH - kViewportMin : minVal;
+                else if (app->resizeDrag == 3) maxVal = (H > app->panelTopH + kViewportMin)    ? H - app->panelTopH    - kViewportMin : minVal;
+                else if (app->resizeDrag == 1) maxVal = (W > app->panelRightW + kViewportMin)  ? W - app->panelRightW  - kViewportMin : minVal;
+                else                           maxVal = (W > app->panelLeftW + kViewportMin)   ? W - app->panelLeftW   - kViewportMin : minVal;
+                int64_t nv = static_cast<int64_t>(app->resizeStartVal) + delta;
+                nv = std::max<int64_t>(minVal, std::min<int64_t>(nv, maxVal));
+                *val = static_cast<uint32_t>(nv);
+                return 0;   // 拖拽分隔线期间屏蔽其它交互
+            }
             const float dx = x - app->camera.lastX;
             const float dy = y - app->camera.lastY;
             // Round304：旋转拖拽（gizmoDragMode==4）——沿环切向：鼠标绕枢轴屏幕投影的角度差（顺时针拖=正转，径向拖不转）
@@ -2059,7 +2133,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (axis == 3) {   // 中心方块：垂直拖动（上=放大）
                     f = 1.0f + (app->pressY - y) * 0.004f;
                 } else if (axis >= 0 && axis <= 2) {
-                    const Layout lay = ComputeLayout(app->swapchainExtent);
+                    const Layout lay = ComputeLayout(*app);
                     const VkRect2D& vp = lay.viewport;
                     float view[16], proj[16], mvp[16];
                     app->camera.ViewMatrix(view);
@@ -5340,7 +5414,8 @@ static void UpdateObjectLabels(App& app) {
     const uint64_t nowMs = GetTickCount64();
     if (nowMs - app.objLabelThrottleMs < 100) return;         // 节流
     app.objLabelThrottleMs = nowMs;
-    constexpr int kListW = static_cast<int>(kSideBarWidth) - 2 * kObjPanelPad;   // 面板内宽
+    const Layout layLbl = ComputeLayout(app);   // Round358：跟随可调右栏布局
+    const int kListW = static_cast<int>(layLbl.right.extent.width) - 2 * kObjPanelPad;   // 面板内宽
 
     // Round346：删除最后一个（或全部）模型后 names 为空，RasterizeNameList 因 h<=0 返回 false，
     // 若不显式清空，旧列表（最后一个模型名）会残留不消失。此处直接清空标签。
@@ -5410,7 +5485,7 @@ void DrawLogicBar(App& app, const Layout& layout) {
     VkDeviceSize vertexOffset = 0;
     vkCmdBindVertexBuffers(app.commandBuffer, 0, 1, &app.vertexBuffer, &vertexOffset);
 
-    std::array<PanelSpec, 4> panels{};
+    std::array<PanelSpec, 12> panels{};
     uint32_t panelCount = 0;
     const auto addPanel = [&](VkRect2D r, VkClearColorValue fill, float radius) {
         if (r.extent.width > 0 && r.extent.height > 0) panels[panelCount++] = {r, fill, radius};
@@ -5418,6 +5493,16 @@ void DrawLogicBar(App& app, const Layout& layout) {
     addPanel(layout.top, kPanelColor, 0.0f);
     addPanel(layout.left, kPanelColor, kCornerRadius);
     addPanel(layout.right, kPanelColor, 0.0f);   // Round346：右部模型栏无圆角
+    addPanel(layout.bottom, kPanelColor, kCornerRadius);   // Round358：底部面板（默认高 150，可拖分隔线调整）
+    // Round358：4 条可拖拽分隔线（1px 边框色，可视化可缩放边缘）
+    addPanel({{0, static_cast<int32_t>(layout.top.extent.height) - 1}, {w, 1}},
+             kBorderColor, 0.0f);
+    addPanel({{0, static_cast<int32_t>(layout.bottom.offset.y)}, {w, 1}},
+             kBorderColor, 0.0f);
+    addPanel({{static_cast<int32_t>(layout.left.extent.width) - 1, static_cast<int32_t>(layout.left.offset.y)},
+              {1, layout.left.extent.height}}, kBorderColor, 0.0f);
+    addPanel({{static_cast<int32_t>(layout.right.offset.x), static_cast<int32_t>(layout.right.offset.y)},
+              {1, layout.right.extent.height}}, kBorderColor, 0.0f);
     addPanel({{0, static_cast<int32_t>(h - kLineWidth)}, {w, 1}},
              kBorderColor, 0.0f);
     for (uint32_t i = 0; i < panelCount; ++i) DrawPanel(app, panels[i]);
@@ -5599,10 +5684,11 @@ void DrawLogicBar(App& app, const Layout& layout) {
     }
 
     // 右侧物体显示栏（Round252：多物体名称列表，Blender 风格；点击行选中）
-    if (w >= kSideBarWidth + 40 && h >= 560) {
-        const int px = static_cast<int>(w) - static_cast<int>(kSideBarWidth) + kObjPanelPad;
-        const int py = static_cast<int>(kTopBarHeight) + kObjPanelPad;
-        const int pw = static_cast<int>(kSideBarWidth) - 2 * kObjPanelPad;
+    // Round358：跟随可调右栏布局（layout 为 ComputeLayout 单一来源）
+    if (layout.right.extent.width >= 40 && layout.right.extent.height >= 100) {
+        const int px = layout.right.offset.x + kObjPanelPad;
+        const int py = layout.right.offset.y + kObjPanelPad;
+        const int pw = static_cast<int>(layout.right.extent.width) - 2 * kObjPanelPad;
         const int ph = 250;   // Round272：物体栏高度÷2（原 500）
         const VkClearColorValue panelFill = kPanelColor;
         const VkClearColorValue whiteBorder = {{1.0f, 1.0f, 1.0f, 1.0f}};
@@ -5748,7 +5834,7 @@ void DrawFrame(App& app) {
     VkDeviceSize vertexOffset = 0;
     vkCmdBindVertexBuffers(app.commandBuffer, 0, 1, &app.vertexBuffer, &vertexOffset);
 
-    const Layout layout = ComputeLayout(app.swapchainExtent);
+    const Layout layout = ComputeLayout(app);
 
     // 3D 视口背景延伸：覆盖左右面板圆角裁切的缺口（用户 167 轮"显示黑边"）
     // —— 面板 kCornerRadius=6 把右/左边切成圆角，露出背景色（0.12，比视口 0.14 更暗）→ 视觉黑色细条

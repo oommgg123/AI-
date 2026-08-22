@@ -17,6 +17,11 @@
 #include "model_import.h"
 #include "settings_window.h"
 
+// ---- Round358：面板布局默认尺寸（App 字段默认值 + 分隔线拖拽最小限制共用；ComputeLayout 单一来源）----
+constexpr uint32_t kTopBarHeight    = 36;    // 顶栏高（默认=最小）
+constexpr uint32_t kSideBarWidth    = 160;   // 左/右栏宽（默认=最小）
+constexpr uint32_t kBottomBarHeight = 150;   // 底部面板高（默认=最小）
+
 // ---- 按钮交互状态机（唯一的状态转换入口）----
 enum class ButtonState : int { Normal = 0, Hover = 1, Pressed = 2, Released = 3 };
 
@@ -121,6 +126,14 @@ struct App {
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkFormat swapchainFormat = VK_FORMAT_UNDEFINED;
     VkExtent2D swapchainExtent{};
+    // ---- Round358：面板可调尺寸（拖分隔线调整；min=默认值，max 保证视口 >=60px；ComputeLayout 读取）----
+    uint32_t panelTopH = kTopBarHeight;         // 顶栏高（可拖 36↑）
+    uint32_t panelLeftW = kSideBarWidth;        // 左栏宽（可拖 160↑）
+    uint32_t panelRightW = kSideBarWidth;       // 右栏宽（可拖 160↑）
+    uint32_t panelBottomH = kBottomBarHeight;   // 底部面板高（可拖 150↑）
+    int resizeDrag = -1;                        // 分隔线拖拽：0=顶栏下缘 1=左栏右缘 2=右栏左缘 3=底栏上缘；-1=无
+    float resizeStartMouse = 0.0f;              // 拖拽起始鼠标（水平线用 y，垂直线用 x）
+    uint32_t resizeStartVal = 0;                // 拖拽起始面板尺寸
     std::vector<VkImage> swapchainImages;
     std::vector<VkImageView> swapchainImageViews;
 
