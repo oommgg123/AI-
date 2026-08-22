@@ -46,3 +46,6 @@ __pycache__/
 *.bak
 *.old
 awa_old.exe
+
+# ===== git-sync 同步工具（不入库，用户 2026-08-22 要求）=====
+git-sync/
