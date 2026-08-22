@@ -55,6 +55,7 @@ void LoadSceneObjects(App& app);    // 启动时加载示例.obj / 命令行指�
 
 // 导入进度（0~100，-1 表示无导入任务）；main.cpp 进度条读取
 extern std::atomic<int> g_importProgress;
+extern std::atomic<int> g_importUploading;   // Round367：GPU 顶点缓冲上传阶段标志（进度条保持显示）
 // 我的世界导入专用进度（与模型导入 g_importProgress 分离：地图窗口 loading 时 3D 视口不显示进度条）
 extern std::atomic<int> g_mcProgress;
 

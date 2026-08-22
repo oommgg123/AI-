@@ -620,6 +620,63 @@ App* GetApp(HWND hwnd) {
     return reinterpret_cast<App*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
 }
 
+// ==================== Round367：双击物体栏名字 → 内联改名（主窗顶部 EDIT 输入条）====================
+static void ApplyRename(App& app);
+static void CancelRename(App& app);
+
+static LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    App* app = GetApp(GetParent(hwnd));
+    if (msg == WM_KEYDOWN) {
+        if (wParam == VK_RETURN) { if (app) ApplyRename(*app); return 0; }   // 回车确认
+        if (wParam == VK_ESCAPE) { if (app) CancelRename(*app); return 0; }  // Esc 取消
+    }
+    return CallWindowProcW(reinterpret_cast<WNDPROC>(GetWindowLongPtrW(hwnd, GWLP_USERDATA)),
+                           hwnd, msg, wParam, lParam);
+}
+
+static void OpenRenameEdit(App& app, int index) {
+    if (app.renameEdit) { DestroyWindow(app.renameEdit); app.renameEdit = nullptr; }
+    app.renameIndex = index;
+    if (index < 0 || index >= static_cast<int>(app.objects.size())) { app.renameIndex = -1; return; }
+    const SceneObject& o = app.objects[static_cast<size_t>(index)];
+    const int ew = 320, eh = 26;
+    const int ex = (static_cast<int>(app.swapchainExtent.width) - ew) / 2;
+    const int ey = static_cast<int>(app.panelTopH) + 10;
+    app.renameEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", o.name.c_str(),
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                     ex, ey, ew, eh, app.hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!app.renameEdit) { app.renameIndex = -1; return; }
+    // 子类化：GWLP_USERDATA 保存原 EDIT WndProc；回车确认 / Esc 取消
+    SetWindowLongPtrW(app.renameEdit, GWLP_USERDATA, GetWindowLongPtrW(app.renameEdit, GWLP_WNDPROC));
+    SetWindowLongPtrW(app.renameEdit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(RenameEditProc));
+    SetFocus(app.renameEdit);
+    SendMessageW(app.renameEdit, EM_SETSEL, 0, static_cast<LPARAM>(-1));   // 全选旧名便于直接输入
+}
+
+static void CancelRename(App& app) {
+    if (app.renameEdit) { DestroyWindow(app.renameEdit); app.renameEdit = nullptr; }
+    app.renameIndex = -1;
+}
+
+static void ApplyRename(App& app) {
+    if (!app.renameEdit || app.renameIndex < 0 ||
+        app.renameIndex >= static_cast<int>(app.objects.size())) { CancelRename(app); return; }
+    wchar_t buf[256];
+    const int n = GetWindowTextW(app.renameEdit, buf, 256);
+    DestroyWindow(app.renameEdit);
+    app.renameEdit = nullptr;
+    const int idx = app.renameIndex;
+    app.renameIndex = -1;
+    if (n > 0) {
+        SceneObject& o = app.objects[static_cast<size_t>(idx)];
+        const std::wstring newName(buf, static_cast<size_t>(n));
+        if (o.name != newName) {
+            o.name = newName;
+            InvalidateRect(app.hwnd, nullptr, FALSE);   // 触发重绘 → UpdateObjectLabels 检测名称变化重建标签
+        }
+    }
+}
+
 inline float MouseX(LPARAM lParam) { return static_cast<float>(static_cast<int16_t>(LOWORD(lParam))); }
 inline float MouseY(LPARAM lParam) { return static_cast<float>(static_cast<int16_t>(HIWORD(lParam))); }
 
@@ -1878,6 +1935,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             app->camera.Zoom(static_cast<float>(wheel) / WHEEL_DELTA);
         }
         return 0;
+    case WM_LBUTTONDBLCLK:   // Round367：双击物体栏名字 → 内联改名
+        if (App* app = GetApp(hwnd)) {
+            const float mx = MouseX(lParam);
+            const float my = MouseY(lParam);
+            const Layout layR = ComputeLayout(*app);
+            if (layR.right.extent.width >= 40 && layR.right.extent.height >= 100) {
+                const int px = layR.right.offset.x + kObjPanelPad;
+                const int py = layR.right.offset.y + kObjPanelPad;
+                const int pw = static_cast<int>(layR.right.extent.width) - 2 * kObjPanelPad;
+                const int ph = static_cast<int>(layR.right.extent.height) - 2 * kObjPanelPad;
+                if (mx >= px && mx < px + pw && my >= py && my < py + ph) {
+                    const int row = static_cast<int>((my - py) / kObjPanelRowH);
+                    if (row >= 0 && row < static_cast<int>(app->objects.size())) {
+                        OpenRenameEdit(*app, row);
+                        return 0;
+                    }
+                }
+            }
+        }
+        return DefWindowProc(hwnd, msg, wParam, lParam);
     case WM_LBUTTONDOWN:
         if (App* app = GetApp(hwnd)) {
             const float mx = MouseX(lParam);
@@ -5811,7 +5888,7 @@ void DrawLogicBar(App& app, const Layout& layout) {
         }
     }
 
-    if (g_importProgress >= 0 && g_importProgress < 100) {
+    if ((g_importProgress >= 0 && g_importProgress < 100) || g_importUploading.load() == 1) {   // Round367：GPU 上传阶段进度条保持显示
         const VkRect2D& vp = layout.viewport;
         if (vp.extent.width > 0 && vp.extent.height > 0) {
             const uint64_t nowMs = GetTickCount64();
@@ -5856,6 +5933,23 @@ void DrawLogicBar(App& app, const Layout& layout) {
                     DrawLine(app, vp, cx + std::cos(a0) * rad, cy + std::sin(a0) * rad,
                                     cx + std::cos(a1) * rad, cy + std::sin(a1) * rad,
                                     segCol, 2.2f);
+                }
+            }
+            // Round367：GPU 上传阶段提示文字（进度条保持满条，真正完成才消失）
+            if (g_importUploading.load() == 1) {
+                const wchar_t* msg = L"正在上传渲染数据…";
+                if (app.importUpLabel.text != msg) {
+                    std::vector<uint8_t> rgba;
+                    int tw = 0, th = 0;
+                    if (RasterizeText(msg, 13, 2, L"Segoe UI", rgba, tw, th))
+                        UploadLabelRgba(app, app.importUpLabel, rgba, tw, th);
+                }
+                if (app.importUpLabel.set != VK_NULL_HANDLE && app.importUpLabel.w > 0) {
+                    const VkRect2D tRect{{static_cast<int32_t>(bx + (bw - static_cast<float>(app.importUpLabel.w)) * 0.5f),
+                                          static_cast<int32_t>(by - 24.0f)},
+                                         {static_cast<uint32_t>(app.importUpLabel.w),
+                                          static_cast<uint32_t>(app.importUpLabel.h)}};
+                    DrawIcon(app, tRect, VkClearColorValue{{0.9f, 0.9f, 0.9f, 1.0f}}, app.importUpLabel.set);
                 }
             }
         }

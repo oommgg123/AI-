@@ -45,6 +45,7 @@ extern bool DecodePngWic(const unsigned char* data, size_t size,
 // 导入进度（定义于此；main.cpp 进度条读取）
 std::atomic<int> g_importProgress{-1};
 std::atomic<int> g_mcProgress{-1};   // MC 导入专用（与模型导入分离）
+std::atomic<int> g_importUploading{0};   // Round367：GPU 上传阶段标志
 
 // ---- MC 窗口 UI 常量（从 ui::g_theme 预设取值，禁止再硬编码 RGB）----
 const COLORREF kMcBg          = ui::g_theme.palette.bg;          // 窗口背景
@@ -542,7 +543,15 @@ HANDLE g_importThread = nullptr;
 DWORD WINAPI ImportWorker(LPVOID param) {
     ImportJob* job = reinterpret_cast<ImportJob*>(param);
     ImportResult r;
-    r.obj.name = L"导入模型";
+    // Round367：模型名 = 导入文件名（去扩展名）；启动默认示例模型叫"立方体"
+    {
+        std::wstring fname = job->path;
+        const size_t slash = fname.find_last_of(L"\\/");
+        if (slash != std::wstring::npos) fname = fname.substr(slash + 1);
+        const size_t dot = fname.find_last_of(L'.');
+        if (dot != std::wstring::npos && dot > 0) fname = fname.substr(0, dot);
+        r.obj.name = g_isStartupImport ? L"立方体" : fname;
+    }
     g_importProgress = 0;
     r.ok = ImportModelFile(job->path.c_str(), r.obj);
     if (!r.ok) r.obj = SceneObject{};
@@ -585,7 +594,13 @@ void ApplyImportResult(App& app) {
         PushUndo(app, e);
     }
     g_stage = "ApplyImportResult:CreateVertexBuffer3D";
-    if (!CreateVertexBuffer3D(app)) {
+    // Round367：GPU 顶点缓冲构建（大模型耗时）期间进度条保持显示（"正在上传渲染数据…"），
+    // 真正完成才结束进度条——消除"进度条读完仍干等"的观感
+    g_importUploading = 1;
+    const bool vbOk = CreateVertexBuffer3D(app);
+    g_importUploading = 0;
+    g_importProgress = -1;
+    if (!vbOk) {
         ShowErrorBox(g_error.c_str());
         g_error.clear();
     }

@@ -190,6 +190,8 @@ struct App {
     int pressedMenuItem = -1;
 
     bool pendingImport = false;
+    HWND renameEdit = nullptr;   // Round367：双击物体栏名字 → 内联改名 EDIT 子控件
+    int renameIndex = -1;        // 待改名物体索引（-1=无）
     uint64_t pendingImportAtMs = 0;
     uint64_t importBarStartMs = 0;
     float importDisplayProg = 0.0f;
@@ -272,6 +274,7 @@ struct App {
     };
     LabelTexture objNameLabel;   // 当前物体名称
     LabelTexture scaleLabel;     // 缩放条数值文字（Round331：系统默认字体 Segoe UI）
+    LabelTexture importUpLabel;  // Round367：GPU 上传中提示文字（"正在上传渲染数据…"）
     LabelTexture coordLabels[3] = {};   // 摄像机坐标 X/Y/Z 文字（Round345）
     uint64_t objLabelThrottleMs = 0;   // 标签重建节流（避免拖动时每帧上传纹理）
     // 缩放距离显示（zoom→距离条淡入；停止 0.5s 淡出）

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 # 版本号单一来源（用户 179 轮：不硬编码）——更新版本只需改这里的 VERSION（major.minor.patch）
-project(vulkan-blank VERSION 1.242.13 LANGUAGES CXX)
+project(vulkan-blank VERSION 1.242.14 LANGUAGES CXX)
 
 # 纯 Vulkan API 应用（Vulkan 1.0+ 双渲染路径 / C++20 / GPU 圆角矩形绘制）
 # 仅依赖 Vulkan 头文件/库 + 构建期 glslc，无任何第三方库
