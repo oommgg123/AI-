@@ -1635,7 +1635,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 return TRUE;
             }
         }
-        break;
+        return DefWindowProc(hwnd, msg, wParam, lParam);   // 非分隔线：默认箭头（本函数所有 case 均 return，不用 break）
     case WM_KEYDOWN:
         if (App* app = GetApp(hwnd)) {
             const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
