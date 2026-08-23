@@ -501,6 +501,43 @@ bool PickTextureFile(HWND owner, wchar_t* outPath, size_t outCap) {
 // Round270：启动加载示例模型时不自动选中（区分手动导入——手动导入仍自动选中新物体）
 static bool g_isStartupImport = false;
 
+
+// 示例.obj 缺失（exe 被单独拷贝运行、资源未随行等）时：内置立方体兜底，保证启动即有参照物（不依赖文件）
+static void PushBuiltinCube(App& app) {
+    SceneObject o;
+    o.name = L"立方体";
+    // 8 顶点（中心在原点，贴地：y 上移 1 → 0..2，与 BuildSceneObject 归一化语义一致）
+    struct V { float x, y, z; };
+    const V p[8] = {{-1,-1,-1},{ 1,-1,-1},{ 1,-1, 1},{-1,-1, 1},
+                    {-1, 1,-1},{ 1, 1,-1},{ 1, 1, 1},{-1, 1, 1}};
+    const int q[6][4] = {{0,1,2,3},{4,5,6,7},{0,1,5,4},{2,3,7,6},{0,3,7,4},{1,2,6,5}};
+    const float nrm[6][3] = {{0,-1,0},{0,1,0},{0,0,-1},{0,0,1},{-1,0,0},{1,0,0}};
+    for (int f = 0; f < 6; ++f) {
+        const int* quad = q[f];
+        const int tri[6] = {quad[0],quad[1],quad[2], quad[0],quad[2],quad[3]};
+        for (int t = 0; t < 6; ++t) {
+            VertexSolid vv;
+            const V& vp = p[tri[t]];
+            vv.pos[0] = vp.x; vv.pos[1] = vp.y + 1.0f; vv.pos[2] = vp.z;
+            vv.normal[0] = nrm[f][0]; vv.normal[1] = nrm[f][1]; vv.normal[2] = nrm[f][2];
+            vv.color[0] = 0.8f; vv.color[1] = 0.8f; vv.color[2] = 0.8f; vv.color[3] = 1.0f;
+            o.solidVerts.push_back(vv);
+            o.solidIndices.push_back(static_cast<uint32_t>(o.solidVerts.size() - 1));
+        }
+    }
+    const int edges[12][2] = {{0,1},{1,2},{2,3},{3,0},{4,5},{5,6},{6,7},{7,4},
+                              {0,4},{1,5},{2,6},{3,7}};
+    for (auto& e : edges) {
+        for (int k = 0; k < 2; ++k) {
+            WirePos wv;
+            wv.pos[0] = p[e[k]].x; wv.pos[1] = p[e[k]].y + 1.0f; wv.pos[2] = p[e[k]].z;
+            o.wireVerts.push_back(wv);
+            o.wireIndices.push_back(static_cast<uint32_t>(o.wireVerts.size() - 1));
+        }
+    }
+    app.scene.objects.push_back(std::move(o));
+}
+
 // ---------------- 场景装载与相机适配 ----------------
 
 void LoadSceneObjects(App& app) {
@@ -521,6 +558,10 @@ void LoadSceneObjects(App& app) {
         std::string fullPath = std::string(exePathUtf8) + "\\示例.obj";
         wchar_t objPath[MAX_PATH];
         MultiByteToWideChar(CP_UTF8, 0, fullPath.c_str(), -1, objPath, MAX_PATH);
+        if (GetFileAttributesW(objPath) == INVALID_FILE_ATTRIBUTES) {
+            PushBuiltinCube(app);   // 示例.obj 缺失 → 内置立方体（不启动导入、不弹窗）
+            return;
+        }
         path = objPath;
     }
     if (!path.empty()) LaunchImport(app, path.c_str());
@@ -572,18 +613,28 @@ DWORD WINAPI ImportWorker(LPVOID param) {
 
 void ApplyImportResult(App& app) {
     g_stage = "ApplyImportResult:开始";
+    const bool startupImport = g_isStartupImport;   // 启动导入失败静默降级（不弹窗打断启动）
     ImportResult r;
     std::swap(r, g_importResult);
     if (!r.ok) {
+        g_isStartupImport = false;
+        if (startupImport) return;   // 启动导入（示例.obj 解析失败）静默；手动导入才提示
         MessageBoxW(app.hwnd, L"无法解析该模型文件（或文件已损坏/格式不支持）。", L"awa - 导入失败",
                     MB_ICONWARNING | MB_OK);
         return;
     }
     g_stage = "ApplyImportResult:vkDeviceWaitIdle";
-    // Round375：设备若已丢失（驱动 TDR/超时）此裸调用会访问违规或挂死——先检后做，丢失则优雅退出导入
+    // Round375+：驱动 TDR 偶发 DEVICE_LOST，下一帧 RecreateSwapchain 自动恢复——短重试而非立即弹窗
     {
-        VkResult devRes = vkDeviceWaitIdle(app.vk.device);
+        VkResult devRes = VK_SUCCESS;
+        for (int attempt = 0; attempt < 10; ++attempt) {
+            devRes = vkDeviceWaitIdle(app.vk.device);
+            if (devRes != VK_ERROR_DEVICE_LOST) break;
+            Sleep(50);
+        }
         if (devRes == VK_ERROR_DEVICE_LOST) {
+            g_isStartupImport = false;
+            if (startupImport) return;
             MessageBoxW(app.hwnd, L"显卡设备丢失，导入已取消。请重启软件或更新显卡驱动后重试。",
                         L"awa - 导入失败", MB_ICONWARNING | MB_OK);
             return;
@@ -1085,3 +1136,4 @@ void McWorldImporter::BeginLoad(HWND owner, const std::wstring& path) {
         if (th) CloseHandle(th);   // 分离线程，后台运行
     }
 }
+

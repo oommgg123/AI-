@@ -63,4 +63,4 @@ bool ImportGLTF(const wchar_t* path, SceneObject& out);
 bool ImportFBX(const wchar_t* path, SceneObject& out);
 
 // OBJ：Wavefront .obj（用户 177 轮自 main.cpp 迁入；188 轮与 STL/GLTF/FBX 归并至本模块）
-bool ParseOBJ(const wchar_t* path, SceneObject& out);
+bool ParseOBJ(const wchar_t* path, SceneObject& out);
