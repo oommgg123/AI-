@@ -527,6 +527,7 @@ bool CreateVertexBuffer(App& app) {
     return true;
 }
 bool CreateVertexBuffer3D(App& app) {
+    VkbLog(("[upload] CreateVertexBuffer3D 入口 objects=" + std::to_string(app.scene.objects.size()) + " vertexColorMode=" + std::to_string(app.scene.vertexColorMode)).c_str());
  // 未算过 AABB 的物体先算（选中拾取用；导入/复制后自动维护）
     for (auto& o : app.scene.objects)
         if (o.boundsMin[0] > 1e29f) ComputeObjectBounds(o);
@@ -552,6 +553,7 @@ bool CreateVertexBuffer3D(App& app) {
         totalIndices += static_cast<uint64_t>(wi) + si;
     }
     if (totalVerts == 0 || totalIndices == 0) return true;
+    VkbLog(("[upload] 无数据提前返回（totalVerts=0），本次未上传 GPU"));
 
  // 颜色位深模式GPU buffer 按模式压缩写入颜色
  // 0=无颜色 24B(pos+normal) | 1=16bit half4 32B | 2=8bit uchar4 28B | 3=4bit 26B | 4=1bit 25B
@@ -793,6 +795,7 @@ bool CreateVertexBuffer3D(App& app) {
  // INCOMPLETE 重试一次；DEVICE_LOST(-4)/OUT_OF_* 不弹窗（下一帧重建 swapchain 自动恢复）
         VkResult submitRes = vkQueueSubmit(app.vk.graphicsQueue, 1, &s, VK_NULL_HANDLE);
         if (submitRes == VK_INCOMPLETE) submitRes = vkQueueSubmit(app.vk.graphicsQueue, 1, &s, VK_NULL_HANDLE);
+    VkbLog(("[upload] vkQueueSubmit 结果=" + std::to_string(static_cast<int>(submitRes)) + "（0=SUCCESS -4=DEVICE_LOST -7=INCOMPLETE）").c_str());
         if (submitRes != VK_SUCCESS && submitRes != VK_SUBOPTIMAL_KHR) {
  // DEVICE_LOST / OUT_OF_HOST|DEVICE_MEMORY 等驱动级错误——静默不弹窗
  // 数据已写入 GPU 缓冲，只是命令未执行；下一帧 DrawFrame 的 RecreateSwapchain 会自动恢复
@@ -806,6 +809,7 @@ bool CreateVertexBuffer3D(App& app) {
         {
             VkResult waitRes = vkQueueWaitIdle(app.vk.graphicsQueue);
             if (waitRes != VK_SUCCESS && waitRes != VK_SUBOPTIMAL_KHR) {
+    VkbLog(("[upload] vkQueueWaitIdle 结果=" + std::to_string(static_cast<int>(waitRes)) + "（0=SUCCESS -4=DEVICE_LOST）").c_str());
                 if (waitRes != VK_ERROR_DEVICE_LOST &&
                     waitRes != VK_ERROR_OUT_OF_HOST_MEMORY &&
                     waitRes != VK_ERROR_OUT_OF_DEVICE_MEMORY)
@@ -818,6 +822,7 @@ bool CreateVertexBuffer3D(App& app) {
 
         vkDestroyBuffer(app.vk.device, stageBuf, nullptr);
     vkFreeMemory(app.vk.device, stageMem, nullptr);
+    VkbLog(("[upload] 上传完成，return true"));
     return true;
 }
 bool CreateRoundedRectPipeline(App& app, VkPipelineLayout& outLayout, VkPipeline& outPipeline) {
