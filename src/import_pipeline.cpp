@@ -582,7 +582,7 @@ void ApplyImportResult(App& app) {
     g_stage = "ApplyImportResult:vkDeviceWaitIdle";
     // Round375：设备若已丢失（驱动 TDR/超时）此裸调用会访问违规或挂死——先检后做，丢失则优雅退出导入
     {
-        VkResult devRes = vkDeviceWaitIdle(app.device);
+        VkResult devRes = vkDeviceWaitIdle(app.vk.device);
         if (devRes == VK_ERROR_DEVICE_LOST) {
             MessageBoxW(app.hwnd, L"显卡设备丢失，导入已取消。请重启软件或更新显卡驱动后重试。",
                         L"awa - 导入失败", MB_ICONWARNING | MB_OK);
@@ -591,23 +591,23 @@ void ApplyImportResult(App& app) {
     }
     HCURSOR prevCursor = SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32650)));
     // Round249：追加而非清空——新导入物体不会删除已有物体（多物体场景）
-    app.objects.push_back(std::move(r.obj));
+    app.scene.objects.push_back(std::move(r.obj));
     // Round270：启动加载的示例模型**不自动选中**（打开软件默认无选中）；手动导入仍自动选中新物体
     if (g_isStartupImport) {
         g_isStartupImport = false;
-        app.selectedObject = -1;
+        app.scene.selectedObject = -1;
     } else {
-        app.selectedObject = static_cast<int>(app.objects.size()) - 1;
+        app.scene.selectedObject = static_cast<int>(app.scene.objects.size()) - 1;
     }
     // Round250：记录撤销（Add）——启动导入无选中（selectedObject=-1）时不记录，
     // 否则 objects[-1] 越界访问（Round278 崩溃根因：启动即崩 vkDeviceWaitIdle / Debug 断言）
-    if (app.selectedObject >= 0) {
-        App::UndoEntry e;
-        e.op = App::UndoOp::Add;
-        e.index = app.selectedObject;
+    if (app.scene.selectedObject >= 0) {
+        UndoEntry e;
+        e.op = UndoOp::Add;
+        e.index = app.scene.selectedObject;
         // Round371：操作式撤销——导入不拷贝大模型（内存翻倍主因），记录路径，redo 时重新导入
         e.importPath = r.path;
-        e.name = app.objects[app.selectedObject].name;
+        e.name = app.scene.objects[app.scene.selectedObject].name;
         PushUndo(app, e);
     }
     g_stage = "ApplyImportResult:CreateVertexBuffer3D";
@@ -635,7 +635,7 @@ void WaitForImportThread() {
 
 void LaunchImport(App& app, const wchar_t* path) {
     WaitForImportThread();
-    app.importBarStartMs = GetTickCount64();
+    app.ui.importBarStartMs = GetTickCount64();
     ImportJob* job = new ImportJob{app.hwnd, std::wstring(path)};
     g_importThread = CreateThread(nullptr, 0, ImportWorker, job, 0, nullptr);
 }

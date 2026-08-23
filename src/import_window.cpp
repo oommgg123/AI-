@@ -56,19 +56,9 @@ gdi::DoubleBuffer g_db{};   // 双缓冲 DC（惰性缓存，尺寸变化时重�
 UiButton  g_btn3D;
 UiButton  g_btnMC;
 
-// 从 ui::g_theme.button 预设构建共享按钮主题（ButtonPreset 为 COLORREF，ButtonTheme 为 float[4]）
+// #214：统一经 app.h 的 FromUiButtonPreset 派生（单主题源 = ui::g_theme.button）
 ButtonTheme MakeButtonThemeFromPreset() {
-    ButtonTheme t;
-    const ui::FloatColor n = ui::ToFloat(ui::g_theme.button.normal);
-    const ui::FloatColor p = ui::ToFloat(ui::g_theme.button.pressed);
-    const ui::FloatColor r = ui::ToFloat(ui::g_theme.button.released);
-    const ui::FloatColor h = ui::ToFloat(ui::g_theme.button.hoverBorder);
-    t.normal[0] = n.r; t.normal[1] = n.g; t.normal[2] = n.b; t.normal[3] = n.a;
-    t.pressed[0] = p.r; t.pressed[1] = p.g; t.pressed[2] = p.b; t.pressed[3] = p.a;
-    t.released[0] = r.r; t.released[1] = r.g; t.released[2] = r.b; t.released[3] = r.a;
-    t.hoverBorder[0] = h.r; t.hoverBorder[1] = h.g; t.hoverBorder[2] = h.b; t.hoverBorder[3] = h.a;
-    t.animSpeed = ui::g_theme.button.animSpeed;
-    return t;
+    return FromUiButtonPreset(ui::g_theme.button);
 }
 ButtonTheme g_btnTheme = MakeButtonThemeFromPreset();
 bool g_3dPressed = false;   // "导入 3D 模型…"是否处于"按下未释放"
