@@ -655,6 +655,64 @@ void DrawFrame(App& app) {
             MatMul4(mvp, model, mvpm);
             Push3D push3d{};
             std::memcpy(push3d.mvp, mvpm, 64);
+    {   // [数据] 顶点与 push 首帧检查
+        static bool s_checked = false;
+        if (!s_checked) {
+            s_checked = true;
+            VkbLog(("[数据] mvp0=" + std::to_string(mvp[0]) + " mvp5=" + std::to_string(mvp[5]) +
+                   " mvp10=" + std::to_string(mvp[10]) + " mvp15=" + std::to_string(mvp[15])).c_str());
+            VkbLog(("[数据] model0=" + std::to_string(model[0]) + " model5=" + std::to_string(model[5]) +
+                   " model10=" + std::to_string(model[10]) + " model15=" + std::to_string(model[15])).c_str());
+            VkbLog(("[数据] push3d.mode=" + std::to_string(push3d.mode) +
+                   " gridR=" + std::to_string(push3d.gridRadius) +
+                   " modelR=" + std::to_string(push3d.modelRadius) +
+                   " hasColor=" + std::to_string(push3d.hasColor) +
+                   " fadeDis=" + std::to_string(push3d.fadeDisable) +
+                   " camXZ=" + std::to_string(push3d.camXZ[0]) + "," + std::to_string(push3d.camXZ[1]) +
+                   " objXZ=" + std::to_string(push3d.objXZ[0]) + "," + std::to_string(push3d.objXZ[1])).c_str());
+            if (!obj.solidVerts.empty()) {
+                const VertexSolid& v0 = obj.solidVerts[0];
+                const VertexSolid& v1 = obj.solidVerts[obj.solidVerts.size()-1];
+                VkbLog(("[数据] v0.pos=" + std::to_string(v0.pos[0]) + "," + std::to_string(v0.pos[1]) + "," + std::to_string(v0.pos[2]) +
+                       " vN.pos=" + std::to_string(v1.pos[0]) + "," + std::to_string(v1.pos[1]) + "," + std::to_string(v1.pos[2])).c_str());
+            }
+            if (!obj.solidIndices.empty()) {
+                VkbLog(("[数据] idx0=" + std::to_string(obj.solidIndices[0]) +
+                       " idx1=" + std::to_string(obj.solidIndices[1]) +
+                       " idx2=" + std::to_string(obj.solidIndices[2]) +
+                       " idxN=" + std::to_string(obj.solidIndices[obj.solidIndices.size()-1])).c_str());
+            }
+        }
+    }
+    {   // [数据] 顶点与 push 首帧检查
+        static bool s_checked = false;
+        if (!s_checked) {
+            s_checked = true;
+            VkbLog(("[数据] mvp0=" + std::to_string(mvp[0]) + " mvp5=" + std::to_string(mvp[5]) +
+                   " mvp10=" + std::to_string(mvp[10]) + " mvp15=" + std::to_string(mvp[15])).c_str());
+            VkbLog(("[数据] model0=" + std::to_string(model[0]) + " model5=" + std::to_string(model[5]) +
+                   " model10=" + std::to_string(model[10]) + " model15=" + std::to_string(model[15])).c_str());
+            VkbLog(("[数据] push3d.mode=" + std::to_string(push3d.mode) +
+                   " gridR=" + std::to_string(push3d.gridRadius) +
+                   " modelR=" + std::to_string(push3d.modelRadius) +
+                   " hasColor=" + std::to_string(push3d.hasColor) +
+                   " fadeDis=" + std::to_string(push3d.fadeDisable) +
+                   " camXZ=" + std::to_string(push3d.camXZ[0]) + "," + std::to_string(push3d.camXZ[1]) +
+                   " objXZ=" + std::to_string(push3d.objXZ[0]) + "," + std::to_string(push3d.objXZ[1])).c_str());
+            if (!obj.solidVerts.empty()) {
+                const VertexSolid& v0 = obj.solidVerts[0];
+                const VertexSolid& v1 = obj.solidVerts[obj.solidVerts.size()-1];
+                VkbLog(("[数据] v0.pos=" + std::to_string(v0.pos[0]) + "," + std::to_string(v0.pos[1]) + "," + std::to_string(v0.pos[2]) +
+                       " vN.pos=" + std::to_string(v1.pos[0]) + "," + std::to_string(v1.pos[1]) + "," + std::to_string(v1.pos[2])).c_str());
+            }
+            if (!obj.solidIndices.empty()) {
+                VkbLog(("[数据] idx0=" + std::to_string(obj.solidIndices[0]) +
+                       " idx1=" + std::to_string(obj.solidIndices[1]) +
+                       " idx2=" + std::to_string(obj.solidIndices[2]) +
+                       " idxN=" + std::to_string(obj.solidIndices[obj.solidIndices.size()-1])).c_str());
+            }
+        }
+    }
  push3d.mode = 1.0f; // 实体光照（线框模式走 line3d 分支，不走这里）
             push3d.gridRadius = fadeRadius;
  push3d.modelRadius = kDefaultFadeRadius; // 固定渲染距离，不随模型变化
