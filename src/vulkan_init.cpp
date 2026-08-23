@@ -528,6 +528,15 @@ bool CreateVertexBuffer(App& app) {
 }
 bool CreateVertexBuffer3D(App& app) {
     VkbLog(("[upload] CreateVertexBuffer3D 入口 objects=" + std::to_string(app.scene.objects.size()) + " vertexColorMode=" + std::to_string(app.scene.vertexColorMode)).c_str());
+    {
+        uint64_t tv = 0, ti = 0, tw = 0;
+        for (const auto& oo : app.scene.objects) {
+            tv += oo.solidVerts.size(); ti += oo.solidIndices.size() + oo.wireIndices.size(); tw += oo.wireVerts.size();
+            VkbLog(("[upload]   物体 sv=" + std::to_string(oo.solidVerts.size()) + " si=" + std::to_string(oo.solidIndices.size()) +
+                   " wv=" + std::to_string(oo.wireVerts.size()) + " wi=" + std::to_string(oo.wireIndices.size())).c_str());
+        }
+        VkbLog(("[upload]   汇总 totalVerts=" + std::to_string(tv) + " totalIndices=" + std::to_string(ti) + " totalWire=" + std::to_string(tw)).c_str());
+    }
  // 未算过 AABB 的物体先算（选中拾取用；导入/复制后自动维护）
     for (auto& o : app.scene.objects)
         if (o.boundsMin[0] > 1e29f) ComputeObjectBounds(o);
