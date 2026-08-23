@@ -1432,7 +1432,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     initStep(CreatePipelineAxis(app), "CreatePipelineAxis");
     initStep(CreatePipelineLine3d(app), "CreatePipelineLine3d");
     initStep(CreatePipelineFXAA(app), "CreatePipelineFXAA");
- initStep(CreatePipelineOutline(app), "CreatePipelineOutline"); // initStep(CreateCommandResources(app), "CreateCommandResources");
+    initStep(CreatePipelineOutline(app), "CreatePipelineOutline");
+    initStep(CreateCommandResources(app), "CreateCommandResources");
     if (!initOk) {
         ShowErrorBox(g_error.c_str());
         Cleanup(app);
