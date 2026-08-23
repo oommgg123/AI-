@@ -501,7 +501,6 @@ bool PickTextureFile(HWND owner, wchar_t* outPath, size_t outCap) {
 // Round270：启动加载示例模型时不自动选中（区分手动导入——手动导入仍自动选中新物体）
 static bool g_isStartupImport = false;
 
-
 // 示例.obj 缺失（exe 被单独拷贝运行、资源未随行等）时：内置立方体兜底，保证启动即有参照物（不依赖文件）
 static void PushBuiltinCube(App& app) {
     SceneObject o;
@@ -541,6 +540,7 @@ static void PushBuiltinCube(App& app) {
 // ---------------- 场景装载与相机适配 ----------------
 
 void LoadSceneObjects(App& app) {
+    VkbLog((std::string("[startup] LoadSceneObjects 开始，g_startupObjPath=") + (g_startupObjPath[0] ? "有" : "空") + "，exe目录示例.obj 检查中").c_str());
     g_isStartupImport = true;   // Round270：启动加载的示例模型不自动选中（默认无选中）
     std::wstring path;
     if (g_startupObjPath[0]) {
@@ -559,11 +559,13 @@ void LoadSceneObjects(App& app) {
         wchar_t objPath[MAX_PATH];
         MultiByteToWideChar(CP_UTF8, 0, fullPath.c_str(), -1, objPath, MAX_PATH);
         if (GetFileAttributesW(objPath) == INVALID_FILE_ATTRIBUTES) {
+            VkbLog("[startup] 示例.obj 缺失 → 使用内置立方体兜底");
             PushBuiltinCube(app);   // 示例.obj 缺失 → 内置立方体（不启动导入、不弹窗）
             return;
         }
         path = objPath;
     }
+    VkbLog((std::string("[startup] 启动导入: ") + std::string(path.begin(), path.end())).c_str());
     if (!path.empty()) LaunchImport(app, path.c_str());
 }
 
@@ -604,6 +606,7 @@ DWORD WINAPI ImportWorker(LPVOID param) {
     }
     if (!r.ok) r.obj = SceneObject{};
     g_importProgress = r.ok ? 100 : -1;
+    VkbLog((std::string("[import] 解析完成 ok=") + (r.ok ? "true" : "false") + " 物体名=" + std::string(r.obj.name.begin(), r.obj.name.end()) + " 顶点数=" + std::to_string(r.obj.solidVerts.size()) + " 索引数=" + std::to_string(r.obj.solidIndices.size()) + " 路径=" + std::string(r.path.begin(), r.path.end())).c_str());
     g_importResult = std::move(r);
     const HWND h = job->mainHwnd;
     delete job;
@@ -642,6 +645,7 @@ void ApplyImportResult(App& app) {
     }
     HCURSOR prevCursor = SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32650)));
     // Round249：追加而非清空——新导入物体不会删除已有物体（多物体场景）
+    VkbLog(("[import] ApplyImportResult 场景物体数=" + std::to_string(app.scene.objects.size()) + " 索引数=" + std::to_string(app.scene.objects.back().solidIndices.size())).c_str());
     app.scene.objects.push_back(std::move(r.obj));
     // Round270：启动加载的示例模型**不自动选中**（打开软件默认无选中）；手动导入仍自动选中新物体
     if (g_isStartupImport) {
