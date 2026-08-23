@@ -786,7 +786,7 @@ bool CreateVertexBuffer3D(App& app) {
             bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             bb.buffer = stageBuf;
-            bb.offset = 0;
+            bb.offset = rg.srcOff;
             bb.size = rg.size;
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                  0, 0, nullptr, 1, &bb, 0, nullptr);
