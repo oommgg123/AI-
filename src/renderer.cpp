@@ -600,6 +600,40 @@ void DrawFrame(App& app) {
         else if (cmode == 4) solidPipe = app.vk.pipelineSolid1;
  const float hasColor = (cmode == 0) ? 0.0f : (cmode == 4 ? 2.0f : 1.0f); // 2=1bit 灰度广播
         for (const auto& obj : app.scene.objects) {
+    {   // [诊断] 首帧物体渲染状态（只打一次）
+        static bool s_rendered = false;
+        if (!s_rendered) {
+            s_rendered = true;
+            const int cmode0 = app.scene.vertexColorMode;
+            VkbLog(("[render]   缓冲 v3d=" + std::to_string(app.vk.vertexBuffer3D != VK_NULL_HANDLE) +
+                   " i3d=" + std::to_string(app.vk.indexBuffer3D != VK_NULL_HANDLE) +
+                   " wv3d=" + std::to_string(app.vk.wireVtxBuffer3D != VK_NULL_HANDLE) +
+                   " v3dCap=" + std::to_string(app.vk.vertexBuffer3DCapacity) +
+                   " i3dCap=" + std::to_string(app.vk.indexBuffer3DCapacity) +
+                   " wv3dCap=" + std::to_string(app.vk.wireVtxBuffer3DCapacity)).c_str());
+            VkbLog(("[render]   缓冲 v3d=" + std::to_string(app.vk.vertexBuffer3D != VK_NULL_HANDLE) +
+                   " i3d=" + std::to_string(app.vk.indexBuffer3D != VK_NULL_HANDLE) +
+                   " wv3d=" + std::to_string(app.vk.wireVtxBuffer3D != VK_NULL_HANDLE) +
+                   " v3dCap=" + std::to_string(app.vk.vertexBuffer3DCapacity) +
+                   " i3dCap=" + std::to_string(app.vk.indexBuffer3DCapacity) +
+                   " wv3dCap=" + std::to_string(app.vk.wireVtxBuffer3DCapacity)).c_str());
+            VkbLog(("[render] 首帧 renderMode=" + std::to_string(app.ui.renderMode) +
+                   " 物体数=" + std::to_string(app.scene.objects.size()) +
+                   " 顶点色模式=" + std::to_string(cmode0) +
+                   " noColorPipe=" + std::to_string(app.vk.pipelineSolidNoColor != VK_NULL_HANDLE) +
+                   " solidPipe=" + std::to_string(app.vk.pipelineSolid != VK_NULL_HANDLE) +
+                   " line3dPipe=" + std::to_string(app.vk.pipelineLine3d != VK_NULL_HANDLE)).c_str());
+            for (const auto& oo : app.scene.objects) {
+                VkbLog(("[render]   物体=" + std::string(oo.name.begin(), oo.name.end()) +
+                       " sv=" + std::to_string(oo.solidVerts.size()) +
+                       " si=" + std::to_string(oo.solidIndices.size()) +
+                       " wv=" + std::to_string(oo.wireVerts.size()) +
+                       " wi=" + std::to_string(oo.wireIndices.size()) +
+                       " vo=" + std::to_string(oo.vertexOffset) +
+                       " sio=" + std::to_string(oo.solidIndexOffset)).c_str());
+            }
+        }
+    }
  // 线框模式：实体几何在此跳过，统一在"网格之后"的线框 pass 绘制（保证白线盖在网格上、不透明）
             if (app.ui.renderMode == 1) continue;
             const uint32_t n = static_cast<uint32_t>(obj.solidIndices.size());
