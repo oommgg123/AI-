@@ -673,6 +673,19 @@ void DrawFrame(App& app) {
  // solidIndices 为局部索引(0..sv-1)，vertexBuffer3D 现只含 solid 顶点
  // 已移除 wire 冗余副本，firstVertex 必须=obj.vertexOffset 起点。
  // 旧代码 +obj.wireVerts.size 是 前的布局残留——会越界读 GPU 缓冲→设备丢失→卡死。
+    {   // [实体] 绘制确认（节流）
+        static uint64_t s_drawNo = 0;
+        ++s_drawNo;
+        if (s_drawNo <= 3 || (s_drawNo % 300) == 0) {
+            VkbLog(("[实体] draw#" + std::to_string(s_drawNo) +
+                   " n=" + std::to_string(n) +
+                   " sio=" + std::to_string(obj.solidIndexOffset) +
+                   " vo=" + std::to_string(obj.vertexOffset) +
+                   " pipe=" + std::to_string(reinterpret_cast<uintptr_t>(solidPipe)) +
+                   " v3d=" + std::to_string(app.vk.vertexBuffer3D != VK_NULL_HANDLE) +
+                   " i3d=" + std::to_string(app.vk.indexBuffer3D != VK_NULL_HANDLE)).c_str());
+        }
+    }
             vkCmdDrawIndexed(app.vk.commandBuffer, n, 1, obj.solidIndexOffset,
                              static_cast<int32_t>(obj.vertexOffset), 0);
         }
