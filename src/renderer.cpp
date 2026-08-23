@@ -481,6 +481,10 @@ void EndFrameAndPresent(App& app, uint32_t imageIndex) {
     }
 }
 void DrawFrame(App& app) {
+    const uint64_t tFrameStart = GetTickCount64();
+    static uint64_t s_lastFrameLog = 0;
+    static uint64_t s_frameNo = 0;
+    ++s_frameNo;
     g_stage = "DrawFrame:交换链/acquire";
     if (app.resizePending && app.vk.swapchain != VK_NULL_HANDLE) {
         RECT cr{};
@@ -926,5 +930,10 @@ void DrawFrame(App& app) {
     g_stage = "DrawFrame:逻辑栏/2D";
     DrawLogicBar(app, layout);
 
+    if (s_frameNo - s_lastFrameLog >= 60 || s_frameNo == 1) {
+        s_lastFrameLog = s_frameNo;
+        const uint64_t ms = GetTickCount64() - tFrameStart;
+        VkbLog(("[frame] #" + std::to_string(s_frameNo) + " 耗时=" + std::to_string(ms) + "ms g_stage=" + (g_stage ? g_stage : "null")).c_str());
+    }
     EndFrameAndPresent(app, imageIndex);
 }
