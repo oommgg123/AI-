@@ -621,6 +621,7 @@ bool CreateVertexBuffer3D(App& app) {
         bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
         bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         bi.size = (stageSize < kUploadChunk) ? stageSize : kStageChunk;
+        VKB_TRY(vkCreateBuffer(app.vk.device, &bi, nullptr, &stageBuf));
         VkMemoryRequirements mr;
         vkGetBufferMemoryRequirements(app.vk.device, stageBuf, &mr);
         const uint32_t mi = FindMemoryType(app, mr.memoryTypeBits,
@@ -635,9 +636,6 @@ bool CreateVertexBuffer3D(App& app) {
     }
 
  // 分批生成 + 上传（每块 128MB）——先写 staging 块，记录 copy 区间，最后一次提交
-    struct ChunkRegion { VkBuffer dst; VkDeviceSize srcOff; VkDeviceSize dstOff; VkDeviceSize size; };
-    std::vector<ChunkRegion> regions;
-    regions.reserve((stageSize / kStageChunk) + 8);
     const auto mapStage = [&](VkDeviceSize offset, VkDeviceSize bytes) -> char* {
         void* mp = nullptr;
         if (vkMapMemory(app.vk.device, stageMem, offset, bytes, 0, &mp) != VK_SUCCESS) return nullptr;
@@ -716,17 +714,61 @@ bool CreateVertexBuffer3D(App& app) {
             }
         }
     };
+ // 立即上传单个分块：map(offset 0, 规避 vkMapMemory 偏移对齐限制) → fill → barrier → copy → 提交等待 → unmap。
+ // 每个区域独立目标缓冲、分块即时 flush，互不覆盖，规避共用 staging 偏移错位。
+    auto flushChunk = [&](VkBuffer dstBuf, VkDeviceSize dstOff, VkDeviceSize size) -> bool {
+        VkCommandPool pool = VK_NULL_HANDLE;
+        VkCommandPoolCreateInfo pci{};
+        pci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+        pci.queueFamilyIndex = app.vk.graphicsFamily;
+        if (vkCreateCommandPool(app.vk.device, &pci, nullptr, &pool) != VK_SUCCESS) return false;
+        VkCommandBufferAllocateInfo a{};
+        a.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        a.commandPool = pool; a.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; a.commandBufferCount = 1;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        if (vkAllocateCommandBuffers(app.vk.device, &a, &cmd) != VK_SUCCESS) { vkDestroyCommandPool(app.vk.device, pool, nullptr); return false; }
+        VkCommandBufferBeginInfo b{};
+        b.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        b.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (vkBeginCommandBuffer(cmd, &b) != VK_SUCCESS) { vkDestroyCommandPool(app.vk.device, pool, nullptr); return false; }
+        VkBufferMemoryBarrier bb{};
+        bb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        bb.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+        bb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bb.buffer = stageBuf; bb.offset = 0; bb.size = size;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &bb, 0, nullptr);
+        VkBufferCopy region{};
+        region.srcOffset = 0; region.dstOffset = dstOff; region.size = size;
+        vkCmdCopyBuffer(cmd, stageBuf, dstBuf, 1, &region);
+        if (vkEndCommandBuffer(cmd) != VK_SUCCESS) { vkDestroyCommandPool(app.vk.device, pool, nullptr); return false; }
+        VkSubmitInfo s{};
+        s.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        s.commandBufferCount = 1; s.pCommandBuffers = &cmd;
+        VkResult submitRes = vkQueueSubmit(app.vk.graphicsQueue, 1, &s, VK_NULL_HANDLE);
+        if (submitRes == VK_INCOMPLETE) submitRes = vkQueueSubmit(app.vk.graphicsQueue, 1, &s, VK_NULL_HANDLE);
+        if (submitRes != VK_SUCCESS && submitRes != VK_SUBOPTIMAL_KHR)
+            VkbLog(("[upload] 分块提交结果=" + std::to_string(static_cast<int>(submitRes)) + "（0=OK -4=DEVICE_LOST -7=INCOMPLETE）").c_str());
+        VkResult waitRes = vkQueueWaitIdle(app.vk.graphicsQueue);
+        if (waitRes != VK_SUCCESS && waitRes != VK_SUBOPTIMAL_KHR)
+            VkbLog(("[upload] 分块等待结果=" + std::to_string(static_cast<int>(waitRes)) + "（0=OK -4=DEVICE_LOST）").c_str());
+        vkFreeCommandBuffers(app.vk.device, pool, 1, &cmd);
+        vkDestroyCommandPool(app.vk.device, pool, nullptr);
+        return true;
+    };
  // vert 区
     {
         uint64_t globalV = 0;
         while (globalV * vtxStride < vertBytes) {
             const VkDeviceSize chunkBytes = std::min<VkDeviceSize>(kStageChunk, vertBytes - globalV * vtxStride);
             const uint64_t count = chunkBytes / vtxStride;
-            char* mp = mapStage(0ull, chunkBytes);
+            char* mp = mapStage(0, chunkBytes);
             if (!mp) return false;
             fillSolidRange(globalV, count, mp);
+            if (!flushChunk(app.vk.vertexBuffer3D, globalV * vtxStride, chunkBytes)) { vkUnmapMemory(app.vk.device, stageMem); return false; }
             vkUnmapMemory(app.vk.device, stageMem);
-            regions.push_back({app.vk.vertexBuffer3D, 0ull, globalV * vtxStride, chunkBytes});
             globalV += count;
         }
     }
@@ -736,11 +778,11 @@ bool CreateVertexBuffer3D(App& app) {
         while (globalI * 4 < idxBytes) {
             const VkDeviceSize chunkBytes = std::min<VkDeviceSize>(kStageChunk, idxBytes - globalI * 4);
             const uint64_t count = chunkBytes / 4;
-            char* mp = mapStage(vertBytes, chunkBytes);
+            char* mp = mapStage(0, chunkBytes);
             if (!mp) return false;
             fillIdxRange(globalI, count, reinterpret_cast<uint32_t*>(mp));
+            if (!flushChunk(app.vk.indexBuffer3D, globalI * 4, chunkBytes)) { vkUnmapMemory(app.vk.device, stageMem); return false; }
             vkUnmapMemory(app.vk.device, stageMem);
-            regions.push_back({app.vk.indexBuffer3D, vertBytes, globalI * 4, chunkBytes});
             globalI += count;
         }
     }
@@ -750,87 +792,17 @@ bool CreateVertexBuffer3D(App& app) {
         while (globalW * sizeof(VertexSolid) < wireBytes) {
             const VkDeviceSize chunkBytes = std::min<VkDeviceSize>(kStageChunk, wireBytes - globalW * sizeof(VertexSolid));
             const uint64_t count = chunkBytes / sizeof(VertexSolid);
-            char* mp = mapStage(vertBytes + idxBytes, chunkBytes);
+            char* mp = mapStage(0, chunkBytes);
             if (!mp) return false;
             fillWireRange(globalW, count, reinterpret_cast<VertexSolid*>(mp));
+            if (!flushChunk(app.vk.wireVtxBuffer3D, globalW * sizeof(VertexSolid), chunkBytes)) { vkUnmapMemory(app.vk.device, stageMem); return false; }
             vkUnmapMemory(app.vk.device, stageMem);
-            regions.push_back({app.vk.wireVtxBuffer3D, vertBytes + idxBytes, globalW * sizeof(VertexSolid), chunkBytes});
             globalW += count;
         }
     }
-
-    {
-        VkCommandPool pool = VK_NULL_HANDLE;
-        VkCommandPoolCreateInfo pci{};
-        pci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-        pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-        pci.queueFamilyIndex = app.vk.graphicsFamily;
-        VKB_TRY(vkCreateCommandPool(app.vk.device, &pci, nullptr, &pool));
-        VkCommandBufferAllocateInfo a{};
-        a.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        a.commandPool = pool;
-        a.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        a.commandBufferCount = 1;
-        VkCommandBuffer cmd = VK_NULL_HANDLE;
-        VKB_TRY(vkAllocateCommandBuffers(app.vk.device, &a, &cmd));
-        VkCommandBufferBeginInfo b{};
-        b.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        b.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        VKB_TRY(vkBeginCommandBuffer(cmd, &b));
- // 每块：staging(HOST_WRITE) → TRANSFER_READ barrier → copy
-        for (const auto& rg : regions) {
-            VkBufferMemoryBarrier bb{};
-            bb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-            bb.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
-            bb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            bb.buffer = stageBuf;
-            bb.offset = rg.srcOff;
-            bb.size = rg.size;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 0, 0, nullptr, 1, &bb, 0, nullptr);
-            VkBufferCopy region{};
-            region.srcOffset = rg.srcOff; region.dstOffset = rg.dstOff; region.size = rg.size;
-            vkCmdCopyBuffer(cmd, stageBuf, rg.dst, 1, &region);
-        }
-        VKB_TRY(vkEndCommandBuffer(cmd));
-        VkSubmitInfo s{};
-        s.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        s.commandBufferCount = 1;
-        s.pCommandBuffers = &cmd;
- // →vkQueueSubmit 偶发返 INCOMPLETE/DEVICE_LOST（驱动 TDR/超时/显存压力）
- // INCOMPLETE 重试一次；DEVICE_LOST(-4)/OUT_OF_* 不弹窗（下一帧重建 swapchain 自动恢复）
-        VkResult submitRes = vkQueueSubmit(app.vk.graphicsQueue, 1, &s, VK_NULL_HANDLE);
-        if (submitRes == VK_INCOMPLETE) submitRes = vkQueueSubmit(app.vk.graphicsQueue, 1, &s, VK_NULL_HANDLE);
-    VkbLog(("[upload] vkQueueSubmit 结果=" + std::to_string(static_cast<int>(submitRes)) + "（0=SUCCESS -4=DEVICE_LOST -7=INCOMPLETE）").c_str());
-        if (submitRes != VK_SUCCESS && submitRes != VK_SUBOPTIMAL_KHR) {
- // DEVICE_LOST / OUT_OF_HOST|DEVICE_MEMORY 等驱动级错误——静默不弹窗
- // 数据已写入 GPU 缓冲，只是命令未执行；下一帧 DrawFrame 的 RecreateSwapchain 会自动恢复
-            if (submitRes != VK_ERROR_DEVICE_LOST &&
-                submitRes != VK_ERROR_OUT_OF_HOST_MEMORY &&
-                submitRes != VK_ERROR_OUT_OF_DEVICE_MEMORY)
-                VKB_TRY(submitRes);
-        }
- // vkQueueWaitIdle 同样偶发 DEVICE_LOST(-4)/OUT_OF_*（驱动 TDR/超时），
- // 与上方 vkQueueSubmit 一致——静默不弹窗，下一帧 RecreateSwapchain 自动恢复
-        {
-            VkResult waitRes = vkQueueWaitIdle(app.vk.graphicsQueue);
-            if (waitRes != VK_SUCCESS && waitRes != VK_SUBOPTIMAL_KHR) {
-    VkbLog(("[upload] vkQueueWaitIdle 结果=" + std::to_string(static_cast<int>(waitRes)) + "（0=SUCCESS -4=DEVICE_LOST）").c_str());
-                if (waitRes != VK_ERROR_DEVICE_LOST &&
-                    waitRes != VK_ERROR_OUT_OF_HOST_MEMORY &&
-                    waitRes != VK_ERROR_OUT_OF_DEVICE_MEMORY)
-                    VKB_TRY(waitRes);
-            }
-        }
-        vkFreeCommandBuffers(app.vk.device, pool, 1, &cmd);
-        vkDestroyCommandPool(app.vk.device, pool, nullptr);
-    }
-
-        vkDestroyBuffer(app.vk.device, stageBuf, nullptr);
+    vkDestroyBuffer(app.vk.device, stageBuf, nullptr);
     vkFreeMemory(app.vk.device, stageMem, nullptr);
-    VkbLog(("[upload] 上传完成，return true"));
+    VkbLog(("[upload] 上传完成，return true"));
     return true;
 }
 bool CreateRoundedRectPipeline(App& app, VkPipelineLayout& outLayout, VkPipeline& outPipeline) {
