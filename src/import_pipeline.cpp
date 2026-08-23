@@ -645,7 +645,6 @@ void ApplyImportResult(App& app) {
     }
     HCURSOR prevCursor = SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32650)));
     // Round249：追加而非清空——新导入物体不会删除已有物体（多物体场景）
-    VkbLog(("[import] ApplyImportResult 场景物体数=" + std::to_string(app.scene.objects.size()) + " 索引数=" + std::to_string(app.scene.objects.back().solidIndices.size())).c_str());
     app.scene.objects.push_back(std::move(r.obj));
     // Round270：启动加载的示例模型**不自动选中**（打开软件默认无选中）；手动导入仍自动选中新物体
     if (g_isStartupImport) {
