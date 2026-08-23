@@ -618,10 +618,9 @@ bool CreateVertexBuffer3D(App& app) {
     {
         VkBufferCreateInfo bi{};
         bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        bi.size = kStageChunk;
         bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
         bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        VKB_TRY(vkCreateBuffer(app.vk.device, &bi, nullptr, &stageBuf));
+        bi.size = (stageSize < kUploadChunk) ? stageSize : kStageChunk;
         VkMemoryRequirements mr;
         vkGetBufferMemoryRequirements(app.vk.device, stageBuf, &mr);
         const uint32_t mi = FindMemoryType(app, mr.memoryTypeBits,
@@ -636,12 +635,12 @@ bool CreateVertexBuffer3D(App& app) {
     }
 
  // 分批生成 + 上传（每块 128MB）——先写 staging 块，记录 copy 区间，最后一次提交
-    struct ChunkRegion { VkBuffer dst; VkDeviceSize dstOff; VkDeviceSize size; };
+    struct ChunkRegion { VkBuffer dst; VkDeviceSize srcOff; VkDeviceSize dstOff; VkDeviceSize size; };
     std::vector<ChunkRegion> regions;
     regions.reserve((stageSize / kStageChunk) + 8);
-    const auto mapStage = [&](VkDeviceSize bytes) -> char* {
+    const auto mapStage = [&](VkDeviceSize offset, VkDeviceSize bytes) -> char* {
         void* mp = nullptr;
-        if (vkMapMemory(app.vk.device, stageMem, 0, bytes, 0, &mp) != VK_SUCCESS) return nullptr;
+        if (vkMapMemory(app.vk.device, stageMem, offset, bytes, 0, &mp) != VK_SUCCESS) return nullptr;
         return static_cast<char*>(mp);
     };
  // solidVerts 压缩写入（按全局顶点序号区间；o.vertexOffset = 该物体 solid 顶点起点）
@@ -723,11 +722,11 @@ bool CreateVertexBuffer3D(App& app) {
         while (globalV * vtxStride < vertBytes) {
             const VkDeviceSize chunkBytes = std::min<VkDeviceSize>(kStageChunk, vertBytes - globalV * vtxStride);
             const uint64_t count = chunkBytes / vtxStride;
-            char* mp = mapStage(chunkBytes);
+            char* mp = mapStage(0ull, chunkBytes);
             if (!mp) return false;
             fillSolidRange(globalV, count, mp);
             vkUnmapMemory(app.vk.device, stageMem);
-            regions.push_back({app.vk.vertexBuffer3D, globalV * vtxStride, chunkBytes});
+            regions.push_back({app.vk.vertexBuffer3D, 0ull, globalV * vtxStride, chunkBytes});
             globalV += count;
         }
     }
@@ -737,11 +736,11 @@ bool CreateVertexBuffer3D(App& app) {
         while (globalI * 4 < idxBytes) {
             const VkDeviceSize chunkBytes = std::min<VkDeviceSize>(kStageChunk, idxBytes - globalI * 4);
             const uint64_t count = chunkBytes / 4;
-            char* mp = mapStage(chunkBytes);
+            char* mp = mapStage(vertBytes, chunkBytes);
             if (!mp) return false;
             fillIdxRange(globalI, count, reinterpret_cast<uint32_t*>(mp));
             vkUnmapMemory(app.vk.device, stageMem);
-            regions.push_back({app.vk.indexBuffer3D, globalI * 4, chunkBytes});
+            regions.push_back({app.vk.indexBuffer3D, vertBytes, globalI * 4, chunkBytes});
             globalI += count;
         }
     }
@@ -751,11 +750,11 @@ bool CreateVertexBuffer3D(App& app) {
         while (globalW * sizeof(VertexSolid) < wireBytes) {
             const VkDeviceSize chunkBytes = std::min<VkDeviceSize>(kStageChunk, wireBytes - globalW * sizeof(VertexSolid));
             const uint64_t count = chunkBytes / sizeof(VertexSolid);
-            char* mp = mapStage(chunkBytes);
+            char* mp = mapStage(vertBytes + idxBytes, chunkBytes);
             if (!mp) return false;
             fillWireRange(globalW, count, reinterpret_cast<VertexSolid*>(mp));
             vkUnmapMemory(app.vk.device, stageMem);
-            regions.push_back({app.vk.wireVtxBuffer3D, globalW * sizeof(VertexSolid), chunkBytes});
+            regions.push_back({app.vk.wireVtxBuffer3D, vertBytes + idxBytes, globalW * sizeof(VertexSolid), chunkBytes});
             globalW += count;
         }
     }
@@ -792,7 +791,7 @@ bool CreateVertexBuffer3D(App& app) {
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                  0, 0, nullptr, 1, &bb, 0, nullptr);
             VkBufferCopy region{};
-            region.srcOffset = 0; region.dstOffset = rg.dstOff; region.size = rg.size;
+            region.srcOffset = rg.srcOff; region.dstOffset = rg.dstOff; region.size = rg.size;
             vkCmdCopyBuffer(cmd, stageBuf, rg.dst, 1, &region);
         }
         VKB_TRY(vkEndCommandBuffer(cmd));
