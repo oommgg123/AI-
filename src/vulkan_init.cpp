@@ -599,14 +599,14 @@ bool CreateVertexBuffer3D(App& app) {
         capacity = size;
         return true;
     };
-    if (!ensureDeviceLocal(vertBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+    if (!ensureDeviceLocal(vertBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                            app.vk.vertexBuffer3DCapacity, app.vk.vertexBuffer3D, app.vk.vertexBufferMemory3D)) return false;
-    if (!ensureDeviceLocal(idxBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+    if (!ensureDeviceLocal(idxBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                            app.vk.indexBuffer3DCapacity, app.vk.indexBuffer3D, app.vk.indexBufferMemory3D)) return false;
  // 线框专用 40B 顶点缓冲（VertexSolid 原样，供 line3d 管线）
     const VkDeviceSize wireBytes = totalWireVerts * sizeof(VertexSolid);
     if (wireBytes > 0 &&
-        !ensureDeviceLocal(wireBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+        !ensureDeviceLocal(wireBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                            app.vk.wireVtxBuffer3DCapacity, app.vk.wireVtxBuffer3D, app.vk.wireVtxBufferMemory3D)) return false;
 
     const VkDeviceSize stageSize = vertBytes + idxBytes + wireBytes;
