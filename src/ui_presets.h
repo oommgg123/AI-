@@ -17,7 +17,7 @@ namespace ui {
 struct Palette {
     COLORREF bg          = RGB(48, 48, 48);    // 窗口背景
     COLORREF panelBg     = RGB(64, 64, 68);    // 面板背景
-    COLORREF panelBorder = RGB(120, 130, 150); // 面板描边
+    COLORREF panelBorder = RGB(74, 82, 96); // 面板描边（减暗白边，原 120,130,150）
     COLORREF text        = RGB(255, 255, 255); // 正文
     COLORREF textDim     = RGB(160, 160, 160); // 次要文字
     COLORREF accent      = RGB(70, 140, 220);  // 主色/选中

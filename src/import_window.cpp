@@ -18,7 +18,7 @@
 
 #include "import_pipeline.h"
 #include "ui_button.h"   // 共享 GDI 按钮渲染管线
-#include "gdi_util.h"    // 共享 GDI 工具：RegisterWindowClass / DoubleBuffer（消除逐字复制的脚手架）
+#include "ui2d.h"    // 共享 GDI 工具：RegisterWindowClass / DoubleBuffer（消除逐字复制的脚手架）
 #include "ui_presets.h"  // 统一控件预设体系：颜色/圆角从 ui::g_theme 取值
 
 namespace {
@@ -50,7 +50,7 @@ VkRect2D BtnMCRect() { return {{kBtnX, kBtnYMC}, {static_cast<uint32_t>(kBtnW), 
 HWND g_importWindow = nullptr;
 HWND g_ownerWnd = nullptr;
 HFONT g_font = nullptr;
-gdi::DoubleBuffer g_db{};   // 双缓冲 DC（惰性缓存，尺寸变化时重建）
+ui2d::DoubleBuffer g_db{};   // 双缓冲 DC（惰性缓存，尺寸变化时重建）
 
 // 共享按钮管线状态（每个按钮一个 UiButton + 一套主题）
 UiButton  g_btn3D;
@@ -165,8 +165,8 @@ LRESULT CALLBACK ImportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         const int ch = full.bottom - full.top;
         // 双缓冲（防闪烁）：惰性缓存 DC（尺寸变化时重建）
         if (!g_db.dc || g_db.w != cw || g_db.h != ch) {
-            gdi::FreeDoubleBuffer(g_db);
-            g_db = gdi::CreateDoubleBuffer(hdc, cw, ch);
+            ui2d::FreeDoubleBuffer(g_db);
+            g_db = ui2d::CreateDoubleBuffer(hdc, cw, ch);
         }
         HDC memDc = g_db.dc;
 
@@ -296,7 +296,7 @@ LRESULT CALLBACK ImportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
     case WM_DESTROY:
         KillTimer(hwnd, kTimerId);
         KillTimer(hwnd, kClickTimerId);
-        gdi::FreeDoubleBuffer(g_db);  // 释放缓存的双缓冲 DC
+        ui2d::FreeDoubleBuffer(g_db);  // 释放缓存的双缓冲 DC
         RestoreOwner();
         g_importWindow = nullptr;
         return 0;
@@ -323,7 +323,7 @@ HWND OpenImportWindow(HWND owner) {
     static bool registered = false;
     if (!registered) {
         // 复用共享 GDI 窗口类注册（消除逐字复制的 WNDCLASSEXW 脚手架）
-        gdi::RegisterWindowClass(kImportWndClass, ImportWndProc, kBgColor, hAppIcon, hAppIcon);
+        ui2d::RegisterWindowClass(kImportWndClass, ImportWndProc, kBgColor, hAppIcon, hAppIcon);
         registered = true;
     }
     RECT rc{ 0, 0, kWidth, kHeight };

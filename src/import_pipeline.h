@@ -14,7 +14,7 @@
 #include "model_import.h"
 #include "mc_blocks.h"   // SceneObject / McBlockGrid / McAtlas（MC 场景构建结果类型）
 #include "mc_map_pipeline.h"  // 地图窗口专属地图管线（动态更新）
-#include "gdi_util.h"   // gdi::DoubleBuffer（MC 窗口双缓冲 DC 缓存）
+#include "ui2d.h"   // ui2d::DoubleBuffer（MC 窗口双缓冲 DC 缓存）
 #include "ui_button.h"  // UiButton / ButtonStateMachine / ButtonTheme（白边正方体按钮管线）
 
 struct App;
@@ -111,7 +111,7 @@ private:
     HFONT      m_font = nullptr;
     std::wstring m_ver;              // 版本文本（OpenWindow 入参）
     bool       m_registered = false;
-    gdi::DoubleBuffer m_db{};   // 双缓冲 DC（惰性缓存，尺寸变化时重建）
+    ui2d::DoubleBuffer m_db{};   // 双缓冲 DC（惰性缓存，尺寸变化时重建）
 
     // 阶段一：真实信息（读取自 level.dat / levelname.txt / db/）
     std::wstring m_rootDir;      // 含 level.dat + db/ 的世界根目录

@@ -2,6 +2,7 @@
 //  picking.cpp（#208 拆分：原 main.cpp ）
 // ============================================================================
 #include "awa_internal.h"
+#include <map>  // std::map（原经被裁剪的间接头文件引入）
 
 using std::uint32_t;
 

@@ -2,6 +2,7 @@
 //  vulkan_init.cpp（#208 拆分：原 main.cpp ）
 // ============================================================================
 #include "awa_internal.h"
+#include "platform/Platform.h"  // GHOST-lite：Vulkan 表面 OS 边界收口
 #include <initguid.h>
 #include <wincodec.h>
 #include "resource.h"
@@ -151,12 +152,10 @@ bool CreateInstance(App& app) {
     return true;
 }
 bool CreateSurface(App& app, HINSTANCE hInstance) {
-    VkWin32SurfaceCreateInfoKHR surfaceInfo{};
-    surfaceInfo.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
-    surfaceInfo.hinstance = hInstance;
-    surfaceInfo.hwnd = app.hwnd;
-    VKB_TRY(g_pfnCreateWin32SurfaceKHR(app.vk.instance, &surfaceInfo, nullptr, &app.vk.surface));
-    return true;
+    // OS 边界收口：Vulkan 表面创建委托 platform::（未来 macOS/Linux 仅替换后端）
+    platform::Window win;
+    win.hwnd = app.hwnd;
+    return platform::CreateVulkanSurface(&win, hInstance, app);
 }
 bool PickPhysicalDevice(App& app) {
     wchar_t forceEnv[16] = {};
@@ -329,13 +328,29 @@ bool CreateSwapchain(App& app, VkSwapchainKHR oldSwapchain) {
  // FIFO 是 Vulkan 强制支持的呈现模式，任何平台可用。
     VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
 
-    VkExtent2D extent = caps.currentExtent;
-    if (extent.width == 0xFFFFFFFFu) {
-        RECT clientRect{};
-        GetClientRect(app.hwnd, &clientRect);
-        extent.width = static_cast<uint32_t>(clientRect.right - clientRect.left);
-        extent.height = static_cast<uint32_t>(clientRect.bottom - clientRect.top);
+ // 交换链尺寸：始终用窗口真实客户区，不再信任 caps.currentExtent。
+ // 根因：init 期在 ShowWindow 之前查询表面能力，bundled SwiftShader 软渲染常把
+ // currentExtent 报成 {0,0}（窗口未显式显示时 WSI 返回 0）→ 交换链尺寸为 0 →
+ // DrawFrame 每帧在 extent==0 处提前 return → 整窗黑屏。
+ // 改用 GetClientRect（窗口创建时已按工作区尺寸，客户区非零），并夹到驱动允许范围。
+    RECT clientRect{};
+    GetClientRect(app.hwnd, &clientRect);
+    uint32_t cw = static_cast<uint32_t>(clientRect.right - clientRect.left);
+    uint32_t ch = static_cast<uint32_t>(clientRect.bottom - clientRect.top);
+    if (cw == 0 || ch == 0) {
+        // 极端兜底：客户区为 0 时退回 currentExtent（仍可能 0，但避免崩溃；后续 DrawFrame 会自愈重建）
+        cw = (caps.currentExtent.width  != 0xFFFFFFFFu) ? caps.currentExtent.width  : 1;
+        ch = (caps.currentExtent.height != 0xFFFFFFFFu) ? caps.currentExtent.height : 1;
     }
+    // 夹到驱动允许的 min/maxImageExtent（VK 规范要求 extent 在此区间内）
+    const auto clampU = [](uint32_t v, uint32_t lo, uint32_t hi) -> uint32_t {
+        if (v < lo) return lo;
+        if (v > hi) return hi;
+        return v;
+    };
+    cw = clampU(cw, caps.minImageExtent.width,  caps.maxImageExtent.width);
+    ch = clampU(ch, caps.minImageExtent.height, caps.maxImageExtent.height);
+    VkExtent2D extent = { cw, ch };
     app.vk.swapchainExtent = extent;
     app.vk.swapchainFormat = surfaceFormat.format;
 
@@ -377,11 +392,18 @@ bool CreateSwapchain(App& app, VkSwapchainKHR oldSwapchain) {
     }
     app.vk.swapchainImages.resize(actualCount);
     imgRes = g_pfnGetSwapchainImagesKHR(app.vk.device, app.vk.swapchain, &actualCount, app.vk.swapchainImages.data());
- while (imgRes == VK_INCOMPLETE) { // resize 后图像数变化——重新查询并扩容
+    // 防御：驱动异常可能反复返回 INCOMPLETE，加重试上限避免启动期无限循环卡死（黑屏无响应）
+    int imgRetries = 0;
+    while (imgRes == VK_INCOMPLETE && imgRetries < 8) {
+        ++imgRetries;
         actualCount = 0;
         g_pfnGetSwapchainImagesKHR(app.vk.device, app.vk.swapchain, &actualCount, nullptr);
         app.vk.swapchainImages.resize(actualCount);
         imgRes = g_pfnGetSwapchainImagesKHR(app.vk.device, app.vk.swapchain, &actualCount, app.vk.swapchainImages.data());
+    }
+    if (imgRes == VK_INCOMPLETE) {
+        SetError("vkGetSwapchainImagesKHR 反复返回 INCOMPLETE（已达重试上限），交换链图像查询失败");
+        return false;
     }
     if (imgRes != VK_SUCCESS) {
         SetError(std::string("Vulkan 调用失败: vkGetSwapchainImagesKHR(data) (VkResult=") + std::to_string(imgRes) + ")");
@@ -561,8 +583,11 @@ bool CreateVertexBuffer3D(App& app) {
         totalWireVerts += static_cast<uint64_t>(wv);
         totalIndices += static_cast<uint64_t>(wi) + si;
     }
-    if (totalVerts == 0 || totalIndices == 0) return true;
-    VkbLog(("[upload] 无数据提前返回（totalVerts=0），本次未上传 GPU"));
+    if (totalVerts == 0 || totalIndices == 0) {
+        VkbLog(("[upload] 物体为空（totalVerts=" + std::to_string(totalVerts) +
+                " totalIndices=" + std::to_string(totalIndices) + "）→ 跳过 GPU 上传").c_str());
+        return true;
+    }
 
  // 颜色位深模式GPU buffer 按模式压缩写入颜色
  // 0=无颜色 24B(pos+normal) | 1=16bit half4 32B | 2=8bit uchar4 28B | 3=4bit 26B | 4=1bit 25B
@@ -744,19 +769,36 @@ bool CreateVertexBuffer3D(App& app) {
         region.srcOffset = 0; region.dstOffset = dstOff; region.size = size;
         vkCmdCopyBuffer(cmd, stageBuf, dstBuf, 1, &region);
         if (vkEndCommandBuffer(cmd) != VK_SUCCESS) { vkDestroyCommandPool(app.vk.device, pool, nullptr); return false; }
+        VkFence fence = VK_NULL_HANDLE;
+        VkFenceCreateInfo fci{};
+        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        if (vkCreateFence(app.vk.device, &fci, nullptr, &fence) != VK_SUCCESS) {
+            vkDestroyCommandPool(app.vk.device, pool, nullptr); return false;
+        }
         VkSubmitInfo s{};
         s.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         s.commandBufferCount = 1; s.pCommandBuffers = &cmd;
-        VkResult submitRes = vkQueueSubmit(app.vk.graphicsQueue, 1, &s, VK_NULL_HANDLE);
-        if (submitRes == VK_INCOMPLETE) submitRes = vkQueueSubmit(app.vk.graphicsQueue, 1, &s, VK_NULL_HANDLE);
-        if (submitRes != VK_SUCCESS && submitRes != VK_SUBOPTIMAL_KHR)
-            VkbLog(("[upload] 分块提交结果=" + std::to_string(static_cast<int>(submitRes)) + "（0=OK -4=DEVICE_LOST -7=INCOMPLETE）").c_str());
-        VkResult waitRes = vkQueueWaitIdle(app.vk.graphicsQueue);
-        if (waitRes != VK_SUCCESS && waitRes != VK_SUBOPTIMAL_KHR)
-            VkbLog(("[upload] 分块等待结果=" + std::to_string(static_cast<int>(waitRes)) + "（0=OK -4=DEVICE_LOST）").c_str());
+        // Round395：提交携带一次性栅栏，用 vkWaitForFences 带超时等待，替代无超时的 vkQueueWaitIdle
+        // （设备异常/驱动挂死时 vkQueueWaitIdle 会永久阻塞主线程 → 软件硬冻结、只能任务管理器杀）
+        VkResult submitRes = vkQueueSubmit(app.vk.graphicsQueue, 1, &s, fence);
+        if (submitRes == VK_INCOMPLETE) submitRes = vkQueueSubmit(app.vk.graphicsQueue, 1, &s, fence);
+        bool waitOk = true;
+        if (submitRes == VK_SUCCESS || submitRes == VK_SUBOPTIMAL_KHR) {
+            const VkResult waitRes = vkWaitForFences(app.vk.device, 1, &fence, VK_TRUE, 3000000000ull /*3s*/);
+            if (waitRes == VK_TIMEOUT) {
+                VkbLog("[upload] 分块等待超时(3s)→判定设备无响应，放弃上传（软件继续运行）");
+                waitOk = false;
+            } else if (waitRes != VK_SUCCESS && waitRes != VK_SUBOPTIMAL_KHR) {
+                VkbLog(("[upload] 分块等待结果=" + std::to_string(static_cast<int>(waitRes)) + "（0=OK -4=DEVICE_LOST）").c_str());
+            }
+        } else {
+            VkbLog(("[upload] 分块提交失败=" + std::to_string(static_cast<int>(submitRes)) + "（0=OK -4=DEVICE_LOST -7=INCOMPLETE）").c_str());
+            waitOk = false;
+        }
+        vkDestroyFence(app.vk.device, fence, nullptr);
         vkFreeCommandBuffers(app.vk.device, pool, 1, &cmd);
         vkDestroyCommandPool(app.vk.device, pool, nullptr);
-        return true;
+        return waitOk;
     };
  // vert 区
     {
@@ -805,7 +847,7 @@ bool CreateVertexBuffer3D(App& app) {
     VkbLog(("[upload] 上传完成，return true"));
     return true;
 }
-bool CreateRoundedRectPipeline(App& app, VkPipelineLayout& outLayout, VkPipeline& outPipeline) {
+bool CreateRoundedRectPipeline(App& app, VkPipelineLayout& outLayout, VkPipeline& outPipeline, VkSampleCountFlagBits samples) {
     VkbLog("[pipeline] 开始创建圆角矩形管线");
     VkShaderModule vertModule = VK_NULL_HANDLE;
     VkShaderModule fragModule = VK_NULL_HANDLE;
@@ -860,7 +902,7 @@ bool CreateRoundedRectPipeline(App& app, VkPipelineLayout& outLayout, VkPipeline
 
     VkPipelineMultisampleStateCreateInfo multisample{};
     multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    multisample.rasterizationSamples = app.aa.msaaSamples;
+    multisample.rasterizationSamples = samples;
 
  // 深度模板：2D UI 不测试/不写深度。**关键**：传统路径的 renderPass 带 depth 附件，
  // Vulkan 规范要求此时 pDepthStencilState 必须非 NULL——否则部分驱动（SwiftShader）
@@ -927,7 +969,7 @@ bool CreateRoundedRectPipeline(App& app, VkPipelineLayout& outLayout, VkPipeline
     VKB_TRY(res);
     return true;
 }
-bool CreatePanelBlendPipeline(App& app, VkPipelineLayout layout, VkPipeline& outPipeline) {
+bool CreatePanelBlendPipeline(App& app, VkPipelineLayout layout, VkPipeline& outPipeline, VkSampleCountFlagBits samples) {
     VkShaderModule vertModule = VK_NULL_HANDLE;
     VkShaderModule fragModule = VK_NULL_HANDLE;
     if (!CreateShaderModule(app.vk.device, kRoundedRectVertSpv, kRoundedRectVertSpvSize, vertModule) ||
@@ -974,7 +1016,7 @@ bool CreatePanelBlendPipeline(App& app, VkPipelineLayout layout, VkPipeline& out
     rasterizer.lineWidth = 1.0f;
     VkPipelineMultisampleStateCreateInfo multisample{};
     multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    multisample.rasterizationSamples = app.aa.msaaSamples;
+    multisample.rasterizationSamples = samples;
     VkPipelineDepthStencilStateCreateInfo depthStencil{};
     depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     depthStencil.depthTestEnable = VK_FALSE;
@@ -1024,16 +1066,23 @@ bool CreatePanelBlendPipeline(App& app, VkPipelineLayout layout, VkPipeline& out
     return res == VK_SUCCESS;
 }
 bool CreatePipeline(App& app) {
-    if (!CreateRoundedRectPipeline(app, app.vk.pipelineLayout, app.vk.pipeline)) return false;
+ // 3D pass 用：视口背景填充 / 坐标轴十字——渲染到 msaaColorView（MSAA 时 4 采样），采样数必须随 MSAA
+    if (!CreateRoundedRectPipeline(app, app.vk.pipelineLayout, app.vk.pipeline, app.aa.msaaSamples)) return false;
  // 框选矩形半透明管线（panel 同款 shader/layout + SRC_ALPHA 混合）——非致命，失败仅框选填充不透明
-    if (!CreatePanelBlendPipeline(app, app.vk.pipelineLayout, app.vk.pipelinePanelBlend)) {
+ // UI pass（渲染到 1 采样 swapchain），固定 1 采样
+    if (!CreatePanelBlendPipeline(app, app.vk.pipelineLayout, app.vk.pipelinePanelBlend, VK_SAMPLE_COUNT_1_BIT)) {
         app.vk.pipelinePanelBlend = VK_NULL_HANDLE;
         VkbLog("[warn] pipelinePanelBlend 创建失败（框选矩形将无半透明）");
     }
     return true;
 }
 bool CreateMenuPipeline(App& app) {
-    return CreateRoundedRectPipeline(app, app.vk.menuPipelineLayout, app.vk.menuPipeline);
+ // 菜单 UI pass（渲染到 1 采样 swapchain），固定 1 采样
+    return CreateRoundedRectPipeline(app, app.vk.menuPipelineLayout, app.vk.menuPipeline, VK_SAMPLE_COUNT_1_BIT);
+}
+bool CreatePipelineUI(App& app) {
+ // 2D 面板 UI pass（渲染到 1 采样 swapchain），固定 1 采样——与 3D pass 的 app.vk.pipeline 严格区分采样数
+    return CreateRoundedRectPipeline(app, app.vk.pipelineLayout, app.vk.pipelineUI, VK_SAMPLE_COUNT_1_BIT);
 }
 bool CreatePipelineAxis(App& app) {
     VkShaderModule vertModule = VK_NULL_HANDLE;
@@ -1977,7 +2026,8 @@ bool CreatePipelineSolid(App& app) {
     renderingInfo.depthAttachmentFormat = app.vk.depthFormat;
 
     auto createSolid = [&](uint32_t stride, const VkVertexInputAttributeDescription* attrs,
-                           uint32_t attrCount, VkPipeline& out) -> bool {
+                           uint32_t attrCount, VkPipeline& out,
+                           VkSampleCountFlagBits samples) -> bool {
         VkVertexInputBindingDescription binding{};
         binding.binding = 0;
         binding.stride = stride;
@@ -1992,6 +2042,7 @@ bool CreatePipelineSolid(App& app) {
         VkPipelineRasterizationStateCreateInfo ras = rasterizer;
         ras.polygonMode = VK_POLYGON_MODE_FILL;
         VkPipelineMultisampleStateCreateInfo ms = multisample;
+        ms.rasterizationSamples = samples;
 
         VkGraphicsPipelineCreateInfo pipelineInfo{};
         pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -2012,11 +2063,13 @@ bool CreatePipelineSolid(App& app) {
         return vkCreateGraphicsPipelines(app.vk.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &out) == VK_SUCCESS;
     };
  // 实体组（FILL）
-    if (!createSolid(kColorStride[0], attrsNoColor, 2, app.vk.pipelineSolidNoColor) ||
-        !createSolid(kColorStride[1], attrsColor[1], 3, app.vk.pipelineSolid) ||
-        !createSolid(kColorStride[2], attrsColor[2], 3, app.vk.pipelineSolid8) ||
-        !createSolid(kColorStride[3], attrsColor[3], 3, app.vk.pipelineSolid4) ||
-        !createSolid(kColorStride[4], attrsColor[4], 3, app.vk.pipelineSolid1)) {
+    if (!createSolid(kColorStride[0], attrsNoColor, 2, app.vk.pipelineSolidNoColor, app.aa.msaaSamples) ||
+        !createSolid(kColorStride[1], attrsColor[1], 3, app.vk.pipelineSolid, app.aa.msaaSamples) ||
+        !createSolid(kColorStride[2], attrsColor[2], 3, app.vk.pipelineSolid8, app.aa.msaaSamples) ||
+        !createSolid(kColorStride[3], attrsColor[3], 3, app.vk.pipelineSolid4, app.aa.msaaSamples) ||
+        !createSolid(kColorStride[4], attrsColor[4], 3, app.vk.pipelineSolid1, app.aa.msaaSamples) ||
+ // 描边 mask pass 专用：渲染到 1 采样 outlineImage，必须 1 采样（与 4 采样实体管线区分）
+        !createSolid(kColorStride[0], attrsNoColor, 2, app.vk.pipelineSolidMask, VK_SAMPLE_COUNT_1_BIT)) {
         SetError("实体管线创建失败（颜色位深 5 模式）");
         vkDestroyShaderModule(app.vk.device, vertModule, nullptr);
         vkDestroyShaderModule(app.vk.device, fragModule, nullptr);
@@ -2215,28 +2268,14 @@ void CmdImageBarrier(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspe
     barrier.dstAccessMask = dstAccess;
     vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
-void ImageBarrierAspect(App& app, VkImage image, VkImageAspectFlags aspect,
-                        VkImageLayout oldLayout, VkImageLayout newLayout,
-                        VkPipelineStageFlags srcStage, VkAccessFlags srcAccess,
-                        VkPipelineStageFlags dstStage, VkAccessFlags dstAccess) {
-    CmdImageBarrier(app.vk.commandBuffer, image, aspect, oldLayout, newLayout,
-                    srcStage, srcAccess, dstStage, dstAccess);
-}
+// 图像布局屏障（app 命令缓冲区版）。aspect 默认 COLOR；深度等用途显式传 VK_IMAGE_ASPECT_DEPTH_BIT。
+// 取代原 ImageBarrierAspect / TransitionBeforeRender / TransitionAfterRender 三个薄封装（#242 合并）。
 void ImageBarrier(App& app, VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout,
                   VkPipelineStageFlags srcStage, VkAccessFlags srcAccess,
-                  VkPipelineStageFlags dstStage, VkAccessFlags dstAccess) {
-    ImageBarrierAspect(app, image, VK_IMAGE_ASPECT_COLOR_BIT, oldLayout, newLayout,
-                       srcStage, srcAccess, dstStage, dstAccess);
-}
-void TransitionBeforeRender(App& app, VkImage image) {
-    ImageBarrier(app, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
-                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
-}
-void TransitionAfterRender(App& app, VkImage image) {
-    ImageBarrier(app, image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-                 VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0);
+                  VkPipelineStageFlags dstStage, VkAccessFlags dstAccess,
+                  VkImageAspectFlags aspect) {
+    CmdImageBarrier(app.vk.commandBuffer, image, aspect, oldLayout, newLayout,
+                    srcStage, srcAccess, dstStage, dstAccess);
 }
 uint32_t FindMemoryType(const App& app, uint32_t typeFilter, VkMemoryPropertyFlags props) {
     VkPhysicalDeviceMemoryProperties memProps;
@@ -2382,10 +2421,10 @@ bool CreateTextResources(App& app, const std::vector<uint8_t>& rgba, int w, int 
 
     VkDescriptorPoolSize poolSize{};
     poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
- poolSize.descriptorCount = 16; // 8→16（球3 + 变换3 共 6 个新图标）
+    poolSize.descriptorCount = 40; // 32→40（新增顶栏宽按钮文字纹理 buttonLabels[3] 描述集）
     VkDescriptorPoolCreateInfo dp{};
     dp.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
- dp.maxSets = 16; // 支持 16 个 descriptor set（球/变换/顶栏图标预留充足）
+    dp.maxSets = 40; // 32→40（新增 buttonLabels[3]）
     dp.poolSizeCount = 1;
     dp.pPoolSizes = &poolSize;
     VKB_TRY(vkCreateDescriptorPool(app.vk.device, &dp, nullptr, &app.vk.textDescriptorPool));
@@ -2630,7 +2669,7 @@ bool CreateTextPipeline(App& app) {
 
     VkPipelineMultisampleStateCreateInfo multisample{};
     multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    multisample.rasterizationSamples = app.aa.msaaSamples;
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT; // 文字仅 2D UI pass（1 采样 swapchain）
 
     VkPipelineColorBlendAttachmentState blendAttachment{};
     blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
@@ -2701,6 +2740,7 @@ bool CreateTextPipeline(App& app) {
 }
 void DestroyAllPipelines(App& app) {
     if (app.vk.pipeline != VK_NULL_HANDLE) { vkDestroyPipeline(app.vk.device, app.vk.pipeline, nullptr); app.vk.pipeline = VK_NULL_HANDLE; }
+    if (app.vk.pipelineUI != VK_NULL_HANDLE) { vkDestroyPipeline(app.vk.device, app.vk.pipelineUI, nullptr); app.vk.pipelineUI = VK_NULL_HANDLE; }
     if (app.vk.pipelinePanelBlend != VK_NULL_HANDLE) { vkDestroyPipeline(app.vk.device, app.vk.pipelinePanelBlend, nullptr); app.vk.pipelinePanelBlend = VK_NULL_HANDLE; }
     if (app.vk.pipelineLayout != VK_NULL_HANDLE) { vkDestroyPipelineLayout(app.vk.device, app.vk.pipelineLayout, nullptr); app.vk.pipelineLayout = VK_NULL_HANDLE; }
     if (app.vk.menuPipeline != VK_NULL_HANDLE) { vkDestroyPipeline(app.vk.device, app.vk.menuPipeline, nullptr); app.vk.menuPipeline = VK_NULL_HANDLE; }
@@ -2712,6 +2752,7 @@ void DestroyAllPipelines(App& app) {
     if (app.vk.pipelineSolid8 != VK_NULL_HANDLE) { vkDestroyPipeline(app.vk.device, app.vk.pipelineSolid8, nullptr); app.vk.pipelineSolid8 = VK_NULL_HANDLE; }
     if (app.vk.pipelineSolid4 != VK_NULL_HANDLE) { vkDestroyPipeline(app.vk.device, app.vk.pipelineSolid4, nullptr); app.vk.pipelineSolid4 = VK_NULL_HANDLE; }
     if (app.vk.pipelineSolid1 != VK_NULL_HANDLE) { vkDestroyPipeline(app.vk.device, app.vk.pipelineSolid1, nullptr); app.vk.pipelineSolid1 = VK_NULL_HANDLE; }
+    if (app.vk.pipelineSolidMask != VK_NULL_HANDLE) { vkDestroyPipeline(app.vk.device, app.vk.pipelineSolidMask, nullptr); app.vk.pipelineSolidMask = VK_NULL_HANDLE; }
     if (app.vk.pipelineLayoutSolid != VK_NULL_HANDLE) { vkDestroyPipelineLayout(app.vk.device, app.vk.pipelineLayoutSolid, nullptr); app.vk.pipelineLayoutSolid = VK_NULL_HANDLE; }
     if (app.vk.pipelineAxis != VK_NULL_HANDLE) { vkDestroyPipeline(app.vk.device, app.vk.pipelineAxis, nullptr); app.vk.pipelineAxis = VK_NULL_HANDLE; }
     if (app.vk.pipelineAxisOccluded != VK_NULL_HANDLE) { vkDestroyPipeline(app.vk.device, app.vk.pipelineAxisOccluded, nullptr); app.vk.pipelineAxisOccluded = VK_NULL_HANDLE; }
@@ -2730,29 +2771,57 @@ void DestroyAllPipelines(App& app) {
 bool ApplyAAMode(App& app, AAMode mode) {
     if (app.vk.device == VK_NULL_HANDLE) return false;
     if (mode == app.aa.aaMode) return true;
+    VkbLog(("[aa] ApplyAAMode 请求 mode=" + std::to_string(static_cast<int>(mode))).c_str());
     vkDeviceWaitIdle(app.vk.device);
 
-    app.aa.aaMode = mode;
-    app.aa.msaaEnabled = false;
-    app.aa.msaaSamples = VK_SAMPLE_COUNT_1_BIT;
+    const AAMode oldMode = app.aa.aaMode;
+    const bool oldMsaaEnabled = app.aa.msaaEnabled;
+    const VkSampleCountFlagBits oldSamples = app.aa.msaaSamples;
+    bool   newMsaa = false;
+    VkSampleCountFlagBits newSamples = VK_SAMPLE_COUNT_1_BIT;
     switch (mode) {
-    case AAMode::MSAA_2x: app.aa.msaaEnabled = true; app.aa.msaaSamples = VK_SAMPLE_COUNT_2_BIT; break;
-    case AAMode::MSAA_4x: app.aa.msaaEnabled = true; app.aa.msaaSamples = VK_SAMPLE_COUNT_4_BIT; break;
-    case AAMode::SSAA:    app.aa.msaaEnabled = true; app.aa.msaaSamples = VK_SAMPLE_COUNT_4_BIT; break;
+    case AAMode::MSAA_2x: newMsaa = true; newSamples = VK_SAMPLE_COUNT_2_BIT; break;
+    case AAMode::MSAA_4x: newMsaa = true; newSamples = VK_SAMPLE_COUNT_4_BIT; break;
+    case AAMode::SSAA:    newMsaa = true; newSamples = VK_SAMPLE_COUNT_4_BIT; break;
     default: break;
     }
+    // 关键修复（FXAA 切换崩溃）：先切到目标 aaMode，使 CreateFXAAResources /
+    // CreatePipelineFXAA（二者按 aaMode==FXAA 门控）能为 FXAA 创建中间纹理与管线。
+    // 重建失败时会同步回退到旧模式并重建设备资源（无空管线窗口：回退在同一调用内完成）。
+    app.aa.aaMode = mode;
+    app.aa.msaaEnabled = newMsaa;
+    app.aa.msaaSamples = newSamples;
 
     DestroyAllPipelines(app);
  // fxaaDescriptorLayout（CreatePipelineFXAA 依赖它，必须在其之前）。
-    if (!RecreateSwapchain(app)) return false;
-    if (!CreatePipeline(app) || !CreateMenuPipeline(app) ||
-        !CreatePipelineGrid(app) || !CreatePipelineSolid(app) ||
-        !CreatePipelineAxis(app) || !CreatePipelineLine3d(app) ||
-        !CreatePipelineFXAA(app) || !CreatePipelineOutline(app) ||
-        !CreateTextPipeline(app)) {
-        SetError("抗锯齿管线重建失败");
+    bool ok = RecreateSwapchain(app);
+    VkbLog(("[aa] RecreateSwapchain=" + std::to_string(ok) +
+            " msaaSamples=" + std::to_string(static_cast<int>(newSamples))).c_str());
+    if (ok) {
+        ok = CreatePipeline(app) && CreatePipelineUI(app) && CreateMenuPipeline(app) &&
+             CreatePipelineGrid(app) && CreatePipelineSolid(app) &&
+             CreatePipelineAxis(app) && CreatePipelineLine3d(app) &&
+             CreatePipelineFXAA(app) && CreatePipelineOutline(app) &&
+             CreateTextPipeline(app);
+        VkbLog(("[aa] 管线重建=" + std::to_string(ok)).c_str());
+    }
+    if (!ok) {
+        // 回退到旧配置：先恢复旧 aaMode，使 FXAA 门控函数按旧模式重建，避免空管线
+        VkbLog("[aa] 重建失败，回退旧模式");
+        app.aa.aaMode = oldMode;
+        app.aa.msaaEnabled = oldMsaaEnabled;
+        app.aa.msaaSamples = oldSamples;
+        DestroyAllPipelines(app);
+        RecreateSwapchain(app);
+        CreatePipeline(app); CreatePipelineUI(app); CreateMenuPipeline(app);
+        CreatePipelineGrid(app); CreatePipelineSolid(app); CreatePipelineAxis(app);
+        CreatePipelineLine3d(app); CreatePipelineFXAA(app); CreatePipelineOutline(app);
+        CreateTextPipeline(app);
+        SaveSettingInt("aa_mode", static_cast<int>(oldMode));
         return false;
     }
+    SaveSettingInt("aa_mode", static_cast<int>(app.aa.aaMode));
+    VkbLog(("[aa] 切换成功 mode=" + std::to_string(static_cast<int>(mode))).c_str());
     return true;
 }
 void Cleanup(App& app) {
@@ -2791,6 +2860,7 @@ void Cleanup(App& app) {
         if (app.vk.imageAvailable != VK_NULL_HANDLE) vkDestroySemaphore(app.vk.device, app.vk.imageAvailable, nullptr);
         if (app.vk.commandPool != VK_NULL_HANDLE) vkDestroyCommandPool(app.vk.device, app.vk.commandPool, nullptr);
         if (app.vk.pipeline != VK_NULL_HANDLE) vkDestroyPipeline(app.vk.device, app.vk.pipeline, nullptr);
+        if (app.vk.pipelineUI != VK_NULL_HANDLE) vkDestroyPipeline(app.vk.device, app.vk.pipelineUI, nullptr);
         if (app.vk.pipelinePanelBlend != VK_NULL_HANDLE) vkDestroyPipeline(app.vk.device, app.vk.pipelinePanelBlend, nullptr);
         if (app.vk.pipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(app.vk.device, app.vk.pipelineLayout, nullptr);
         if (app.vk.menuPipeline != VK_NULL_HANDLE) vkDestroyPipeline(app.vk.device, app.vk.menuPipeline, nullptr);
@@ -2804,6 +2874,7 @@ void Cleanup(App& app) {
         if (app.vk.pipelineSolid8 != VK_NULL_HANDLE) vkDestroyPipeline(app.vk.device, app.vk.pipelineSolid8, nullptr);
         if (app.vk.pipelineSolid4 != VK_NULL_HANDLE) vkDestroyPipeline(app.vk.device, app.vk.pipelineSolid4, nullptr);
         if (app.vk.pipelineSolid1 != VK_NULL_HANDLE) vkDestroyPipeline(app.vk.device, app.vk.pipelineSolid1, nullptr);
+        if (app.vk.pipelineSolidMask != VK_NULL_HANDLE) vkDestroyPipeline(app.vk.device, app.vk.pipelineSolidMask, nullptr);
         if (app.vk.pipelineLayoutSolid != VK_NULL_HANDLE) vkDestroyPipelineLayout(app.vk.device, app.vk.pipelineLayoutSolid, nullptr);
         if (app.vk.pipelineAxis != VK_NULL_HANDLE) vkDestroyPipeline(app.vk.device, app.vk.pipelineAxis, nullptr);
         if (app.vk.pipelineAxisOccluded != VK_NULL_HANDLE) vkDestroyPipeline(app.vk.device, app.vk.pipelineAxisOccluded, nullptr);
@@ -2825,6 +2896,13 @@ void Cleanup(App& app) {
         if (app.vk.penView != VK_NULL_HANDLE) vkDestroyImageView(app.vk.device, app.vk.penView, nullptr);
         if (app.vk.penImage != VK_NULL_HANDLE) vkDestroyImage(app.vk.device, app.vk.penImage, nullptr);
         if (app.vk.penMemory != VK_NULL_HANDLE) vkFreeMemory(app.vk.device, app.vk.penMemory, nullptr);
+        if (app.vk.fileView != VK_NULL_HANDLE) vkDestroyImageView(app.vk.device, app.vk.fileView, nullptr);
+        if (app.vk.fileImage != VK_NULL_HANDLE) vkDestroyImage(app.vk.device, app.vk.fileImage, nullptr);
+        if (app.vk.fileMemory != VK_NULL_HANDLE) vkFreeMemory(app.vk.device, app.vk.fileMemory, nullptr);
+        // 软件图标（awa logo）
+        if (app.vk.appIconView != VK_NULL_HANDLE) vkDestroyImageView(app.vk.device, app.vk.appIconView, nullptr);
+        if (app.vk.appIconImage != VK_NULL_HANDLE) vkDestroyImage(app.vk.device, app.vk.appIconImage, nullptr);
+        if (app.vk.appIconMemory != VK_NULL_HANDLE) vkFreeMemory(app.vk.device, app.vk.appIconMemory, nullptr);
         if (app.vk.importView != VK_NULL_HANDLE) vkDestroyImageView(app.vk.device, app.vk.importView, nullptr);
         if (app.vk.importImage != VK_NULL_HANDLE) vkDestroyImage(app.vk.device, app.vk.importImage, nullptr);
         if (app.vk.importMemory != VK_NULL_HANDLE) vkFreeMemory(app.vk.device, app.vk.importMemory, nullptr);

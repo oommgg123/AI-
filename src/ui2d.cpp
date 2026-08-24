@@ -1,9 +1,9 @@
 // ============================================================================
-//   共享 GDI 工具实现（见 gdi_util.h）
+//   共享 2D 抽象层 ui2d 实现（见 ui2d.h；P3 由 gdi_util 重命名）
 // ============================================================================
-#include "gdi_util.h"
+#include "ui2d.h"
 
-namespace gdi {
+namespace ui2d {
 
 ATOM RegisterWindowClass(LPCWSTR className, WNDPROC wndProc, COLORREF bgColor,
                          HICON hIcon, HICON hIconSm) {
@@ -34,4 +34,4 @@ void FreeDoubleBuffer(DoubleBuffer& db) {
     if (db.bmp) { DeleteObject(db.bmp); db.bmp = nullptr; }
 }
 
-}  // namespace gdi
+}  // namespace ui2d

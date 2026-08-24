@@ -2,6 +2,8 @@
 //  ui3d.cpp（#208 拆分：原 main.cpp ）
 // ============================================================================
 #include "awa_internal.h"
+#include "ui_controls.h"  // 顺位布局 / 控件管理器（主视口面板 border 布局接入）
+#include "import_pipeline.h"  // g_importProgress / g_importUploading（导入进度显示，原经 awa_internal.h 间接引入）
 #include <initguid.h>
 #include <wincodec.h>
 
@@ -65,6 +67,50 @@ ButtonTheme LoadButtonTheme() {
         }
     }
     return theme;
+}
+// 读取 exe 同目录 button_labels.txt（UTF-8，key=label0/label1/label2）覆盖按钮文字。
+// 未配置的键保留 buttons[i].label 默认值；文件缺失则全部保留默认。改文字后重启软件生效。
+void LoadButtonLabels(UiButton* buttons, int n) {
+    if (!buttons || n <= 0) return;
+    wchar_t exePath[MAX_PATH];
+    if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH)) return;
+    char exeUtf8[MAX_PATH * 2] = {0};
+    WideCharToMultiByte(CP_UTF8, 0, exePath, -1, exeUtf8, sizeof(exeUtf8), nullptr, nullptr);
+    std::string path(exeUtf8);
+    const size_t slash = path.find_last_of('\\');
+    if (slash != std::string::npos) path = path.substr(0, slash + 1);
+    path += "button_labels.txt";
+
+    wchar_t wpath[MAX_PATH];
+    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath, MAX_PATH);
+
+    HANDLE h = CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    std::string content;
+    char buf[512];
+    DWORD read = 0;
+    while (ReadFile(h, buf, sizeof(buf), &read, nullptr) && read > 0) content.append(buf, read);
+    CloseHandle(h);
+
+    size_t pos = 0;
+    while (pos < content.size()) {
+        const size_t nl = content.find('\n', pos);
+        std::string line = content.substr(pos, (nl == std::string::npos ? content.size() : nl) - pos);
+        pos = (nl == std::string::npos) ? content.size() : nl + 1;
+        const size_t hash = line.find('#');
+        if (hash != std::string::npos) line = line.substr(0, hash);
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string key = TrimStr(line.substr(0, eq));
+        const std::string val = TrimStr(line.substr(eq + 1));
+        if (val.empty() || key.size() < 6 || key.compare(0, 5, "label") != 0) continue;
+        const int idx = key[5] - '0';
+        if (idx < 0 || idx >= n) continue;
+        wchar_t wbuf[128];
+        MultiByteToWideChar(CP_UTF8, 0, val.c_str(), -1, wbuf, 128);
+        buttons[idx].label = wbuf;
+    }
 }
 void GetSettingsWPath(wchar_t out[MAX_PATH]) {
     out[0] = 0;
@@ -152,20 +198,117 @@ Layout ComputeLayout(const App& app) {
     const uint32_t bottomH = (h > app.ui.panelBottomH) ? app.ui.panelBottomH : 0;
     const uint32_t leftW   = (w > app.ui.panelLeftW)   ? app.ui.panelLeftW   : 0;
     const uint32_t rightW  = (w > app.ui.panelRightW)  ? app.ui.panelRightW  : 0;
-    const uint32_t bodyTop = topH;
-    const uint32_t bodyBottom = (h >= bottomH) ? h - bottomH : 0;
-    const uint32_t bodyH  = (bodyBottom > bodyTop) ? bodyBottom - bodyTop : 0;
-    const uint32_t centerW = (w >= leftW + rightW) ? w - leftW - rightW : 0;
 
+    // 主视口面板接入顺位布局管理器（border 锚点：上/左/右/底/填充；与旧手动数学完全等价）
+    ui::ControlManager mgr;
+    mgr.add({"viewport", 0, ui::Axis::Vertical, ui::Anchor::Top,    0, static_cast<int>(topH),    -1, 0, 0});
+    mgr.add({"viewport", 1, ui::Axis::Vertical, ui::Anchor::Left,   0, static_cast<int>(leftW),   -1, 0, 1});
+    mgr.add({"viewport", 2, ui::Axis::Vertical, ui::Anchor::Right,  0, static_cast<int>(rightW),  -1, 0, 2});
+    mgr.add({"viewport", 3, ui::Axis::Vertical, ui::Anchor::Bottom, 0, static_cast<int>(bottomH), -1, 0, 3});
+    mgr.add({"viewport", 4, ui::Axis::Vertical, ui::Anchor::Fill,   0, -1,                        -1, 1, 4});
+    const RECT client{0, 0, static_cast<int>(w), static_cast<int>(h)};
+    mgr.compute(client);
+
+    auto toVk = [](RECT r) -> VkRect2D {
+        return {{r.left, r.top},
+                {static_cast<uint32_t>(r.right - r.left), static_cast<uint32_t>(r.bottom - r.top)}};
+    };
+    auto R = [&](int id) -> RECT {
+        const ui::Ctrl* c = mgr.find("viewport", id);
+        return c ? c->rect : RECT{0, 0, 0, 0};
+    };
     Layout l{};
-    l.top      = {{0, 0}, {w, topH}};
-    l.left     = {{0, static_cast<int32_t>(bodyTop)}, {leftW, bodyH}};
-    l.right    = {{static_cast<int32_t>(w - rightW), static_cast<int32_t>(bodyTop)},
-                  {rightW, bodyH}};
-    l.bottom   = {{0, static_cast<int32_t>(h - bottomH)}, {w, bottomH}};
-    l.viewport = {{static_cast<int32_t>(leftW), static_cast<int32_t>(bodyTop)},
-                  {centerW, bodyH}};
+    l.top      = toVk(R(0));
+    l.left     = toVk(R(1));
+    l.right    = toVk(R(2));
+    l.bottom   = toVk(R(3));
+    l.viewport = toVk(R(4));
     return l;
+}
+
+// 顶栏控件顺位布局（走控件渲染管线）：gear/edit/分隔线/move/rotate/scale 按顺位从左到右排列。
+// 分隔线作为「控件」(1px) 参与布局，紧贴编辑按钮右侧（gap 小）；同时统一编辑按钮下拉菜单位置。
+// 依赖：app.vk.swapchainExtent（窗口像素）、app.ui.panelTopH（顶栏高，>=36）。
+void ComputeTopBar(App& app, const Layout& layout) {
+    const uint32_t w = app.vk.swapchainExtent.width;
+    const int topH = static_cast<int>(app.ui.panelTopH);
+    const int btnTop = (topH - 30) / 2;
+    const int divH   = 18, divTop = (topH - divH) / 2;
+
+    // ---- 左侧：软件图标（无边框特殊按钮，awa logo，比工具按钮略大一点点）----
+    const int appIconSize = 34;                       // 略大于工具按钮 30，放大一点点
+    const int appIconTop  = (topH - appIconSize) / 2;
+    app.ui.appIcon.rect = {{(int32_t)8, (int32_t)appIconTop},
+                           {(uint32_t)appIconSize, (uint32_t)appIconSize}};
+
+    // ---- 中部：设置/文件/编辑 宽按钮（buttons[0..2]，64×30：图标变小左置 + 文字右置）----
+    // 软件图标与设置按钮间距 8px；宽按钮间距 8px（设置↔文件 间画分割线）
+    const int wBtn = 64, hBtn = 30;
+    const int gap = 8;
+    int x = 8 + appIconSize + 8;  // 设置按钮起点：软件图标右缘 + 8px 间距
+    std::vector<VkRect2D> iconRects;
+    iconRects.push_back(app.ui.appIcon.rect);
+    const int nTop = std::min(static_cast<int>(app.ui.buttons.size()), 3);
+    for (int k = 0; k < nTop; ++k) {
+        app.ui.buttons[k].rect = {{(int32_t)x, (int32_t)btnTop},
+                                  {(uint32_t)wBtn, (uint32_t)hBtn}};
+        iconRects.push_back(app.ui.buttons[k].rect);
+        x += wBtn + gap;
+    }
+    // 相邻图标间隔中心画 1px 竖直分割线：仅 设置↔文件(i=1)；软件图标↔设置(i=0) 无分割线。
+    // （编辑↔移动 分割线取消：移动按钮已移至左部面板垂直排列）
+    app.ui.topDividers.clear();
+    for (size_t i = 0; i + 1 < iconRects.size(); ++i) {
+        if (i != 1) continue;
+        const int midX = iconRects[i].offset.x +
+                         static_cast<int32_t>(iconRects[i].extent.width) + gap / 2;
+        app.ui.topDividers.push_back({{(int32_t)midX, (int32_t)divTop},
+                                     {1u, (uint32_t)divH}});
+    }
+
+    // ---- 左部：移动/旋转/缩放（buttons[3..5]）垂直排列（30×30，间距 5px，顶部留白 10，水平居中）----
+    if (app.ui.buttons.size() >= 6) {
+        const VkRect2D& lp = layout.left;
+        const int bw = 30;
+        const int bx = lp.offset.x + (static_cast<int>(lp.extent.width) - bw) / 2;
+        int by = lp.offset.y + 10;
+        for (int k = 3; k < 6; ++k) {
+            app.ui.buttons[k].rect = {{(int32_t)bx, (int32_t)by},
+                                      {(uint32_t)bw, (uint32_t)bw}};
+            by += bw + 5;
+        }
+    }
+
+    // ---- 右侧：系统按钮 最小化/最大化/关闭（24×24，右侧留 2px 边距 + 4px 间距，垂直居中）----
+    const int sysW = 24, sysH = 24;   // 小号 PS 风格按钮
+    const int sysTop = (topH - sysH) / 2;  // 垂直居中：(36-24)/2=6
+    const int sysMargin = 2;   // 最右按钮距窗口右缘留白
+    const int sysGap = 4;      // 相邻按钮间距（修复："过宽不居中"=按钮贴在一起像一整块）
+    app.ui.sysButtons[2].rect = {{(int32_t)(w - sysMargin - sysW),                  sysTop}, {(uint32_t)sysW, (uint32_t)sysH}}; // 关闭(最右)
+    app.ui.sysButtons[1].rect = {{(int32_t)(w - sysMargin - 2 * sysW - sysGap),     sysTop}, {(uint32_t)sysW, (uint32_t)sysH}}; // 最大化
+    app.ui.sysButtons[0].rect = {{(int32_t)(w - sysMargin - 3 * sysW - 2 * sysGap), sysTop}, {(uint32_t)sysW, (uint32_t)sysH}}; // 最小化(最左)
+
+    // 编辑按钮（buttons[2]）下拉菜单位置跟随（与 main.cpp init 逻辑一致）
+    if (app.ui.buttons.size() >= 3) {
+        const VkRect2D& eb = app.ui.buttons[2].rect;
+        const int btnCenterX = eb.offset.x + static_cast<int32_t>(eb.extent.width) / 2;
+        app.ui.menuRect = {{(int32_t)std::max(btnCenterX - 100, 0),
+                            (int32_t)(eb.offset.y + static_cast<int32_t>(eb.extent.height) + 2)},
+                           {200u, 0u}};
+    }
+    {
+        constexpr float kMenuPad = 10.0f, kMenuItemH = 30.0f, kItemGap = 5.0f;
+        const float mx = (float)app.ui.menuRect.offset.x;
+        const float my = (float)app.ui.menuRect.offset.y;
+        const float mw = (float)app.ui.menuRect.extent.width;
+        const float itemY = my + kMenuPad;
+        const float itemW = (mw - 2.0f * kMenuPad - kItemGap) * 0.5f;
+        for (int i = 0; i < 2; ++i) {
+            const float x2 = mx + kMenuPad + (float)i * (itemW + kItemGap);
+            app.ui.menuItems[i].rect = {{(int32_t)x2, (int32_t)itemY},
+                                        {(uint32_t)itemW, (uint32_t)kMenuItemH}};
+        }
+    }
 }
 int HitResizeDivider(const App& app, float mx, float my) {
     const Layout lay = ComputeLayout(app);
@@ -175,7 +318,7 @@ int HitResizeDivider(const App& app, float mx, float my) {
     const float leftX   = static_cast<float>(lay.left.extent.width);
     const float rightX  = static_cast<float>(lay.right.offset.x);
     if (my >= topY && my <= bottomY) {
- if (std::fabs(mx - leftX) <= kTol) return 1; // 左栏右缘（垂直）
+        // 左栏固定 kLeftBarWidth 不可缩放（用户要求）——不再命中左栏右缘（div==1），无缩放光标/拖拽
  if (std::fabs(mx - rightX) <= kTol) return 2; // 右栏左缘（垂直）
     }
  if (std::fabs(my - bottomY) <= kTol) return 3; // 底栏上缘（全宽）
@@ -433,7 +576,7 @@ bool DecodePngWic(const unsigned char* pngData, size_t pngSize,
     for (size_t i = 0; i < rgba.size(); i += 4) std::swap(rgba[i], rgba[i + 2]);
     return true;
 }
-void DrawIcon(App& app, const VkRect2D& iconRect, VkClearColorValue color, VkDescriptorSet set) {
+void DrawIcon(App& app, const VkRect2D& iconRect, VkClearColorValue color, VkDescriptorSet set, bool white) {
  if (app.vk.textPipeline == VK_NULL_HANDLE || set == VK_NULL_HANDLE) return; // 纹理降级保护
     vkCmdSetScissor(app.vk.commandBuffer, 0, 1, &iconRect);
     vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.textPipeline);
@@ -450,6 +593,8 @@ void DrawIcon(App& app, const VkRect2D& iconRect, VkClearColorValue color, VkDes
     tp.color[1] = color.float32[1];
     tp.color[2] = color.float32[2];
     tp.color[3] = color.float32[3];
+    // mono：白渲染通道=1（按钮图标默认），0=直通彩色（软件图标特殊通道，保留纹理真实颜色）
+    tp.mono = white ? 1.0f : 0.0f;
     vkCmdPushConstants(app.vk.commandBuffer, app.vk.textPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(TextPush), &tp);
     vkCmdDraw(app.vk.commandBuffer, 6, 1, 0, 0);
@@ -588,7 +733,7 @@ static void DrawScaleBar(App& app, const Layout& layout) {
     VkViewport viewport{0.0f, 0.0f, static_cast<float>(app.vk.swapchainExtent.width),
                         static_cast<float>(app.vk.swapchainExtent.height), 0.0f, 1.0f};
     vkCmdSetViewport(app.vk.commandBuffer, 0, 1, &viewport);
-    vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipeline);
+    vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipelineUI);
     VkDeviceSize voff = 0;
     vkCmdBindVertexBuffers(app.vk.commandBuffer, 0, 1, &app.vk.vertexBuffer, &voff);
 
@@ -665,12 +810,13 @@ void UpdateBallButtons(App& app, const Layout& layout) {
         }
     }
 }
-void UploadLabelRgba(App& app, App::LabelTexture& lt,
+void UploadLabelRgbaNow(App& app, App::LabelTexture& lt,
                             const std::vector<uint8_t>& rgba, int w, int h) {
+ // 真正的 GPU 上传（销毁旧纹理+重建+拷贝）。仅从 FlushPendingLabelUploads 在帧首安全点调用，
+ // 绝不在 DrawFrame 命令录制中途直接调用：旧代码在此 vkWaitForFences(inFlightFence,2s)，
+ // 当时 inFlightFence 已复位、当前帧未提交→卡满 2 秒（#215 回归根因）。
     lt.w = lt.h = 0;
     if (w <= 0 || h <= 0 || rgba.empty()) return;
- // 等上一帧完成（inFlightFence，#215）：上一帧可能仍引用旧 image/view，销毁前须确保 GPU 不再使用——只等单帧栅栏，不再 vkDeviceWaitIdle 全设备停顿
-    vkWaitForFences(app.vk.device, 1, &app.vk.inFlightFence, VK_TRUE, 2000000000ull);
     if (lt.view)  vkDestroyImageView(app.vk.device, lt.view, nullptr);
     if (lt.image) vkDestroyImage(app.vk.device, lt.image, nullptr);
     if (lt.memory) vkFreeMemory(app.vk.device, lt.memory, nullptr);
@@ -787,9 +933,39 @@ void UploadLabelRgba(App& app, App::LabelTexture& lt,
     vkUpdateDescriptorSets(app.vk.device, 1, &wd, 0, nullptr);
     lt.w = w; lt.h = h;
 }
+
+void UploadLabelRgba(App& app, App::LabelTexture& lt,
+                            const std::vector<uint8_t>& rgba, int w, int h) {
+    (void)app; // 暂存版不直接触碰 GPU，app 仅保持签名一致
+ // 仅暂存待上传数据；真正的 GPU 纹理销毁/重建/拷贝延迟到 DrawFrame 帧首安全点
+ // （FlushPendingLabelUploads）执行。原因：本函数常在 DrawFrame 命令录制中途被调用
+ // （中键缩放改距离条文字 / 右键平移改坐标标签），若在此直接做 GPU 上传并等待栅栏会卡满 2 秒（#215 回归）。
+    if (w <= 0 || h <= 0 || rgba.empty()) return;
+    lt.pendingRgba = rgba;
+    lt.pendingW = w;
+    lt.pendingH = h;
+    lt.needsUpload = true;
+}
+
+void FlushPendingLabelUploads(App& app) {
+ // 帧首安全点：DrawFrame 已在第 508 行等待上一帧栅栏成功（上一帧已结束），
+ // 当前帧尚未录制命令缓冲，此时销毁旧标签纹理、重建新纹理安全，不会破坏任何进行中的命令缓冲。
+    App::LabelTexture* labels[] = {
+        &app.ui.objNameLabel, &app.ui.objPanelTitle, &app.ui.scaleLabel, &app.ui.importUpLabel,
+        &app.ui.coordLabels[0], &app.ui.coordLabels[1], &app.ui.coordLabels[2],
+        &app.ui.buttonLabels[0], &app.ui.buttonLabels[1], &app.ui.buttonLabels[2],
+    };
+    for (App::LabelTexture* lt : labels) {
+        if (!lt->needsUpload) continue;
+        lt->needsUpload = false;
+        UploadLabelRgbaNow(app, *lt, lt->pendingRgba, lt->pendingW, lt->pendingH);
+    }
+}
 bool RasterizeNameList(const std::vector<std::wstring>& names, int width, int rowH,
                               std::vector<uint8_t>& rgba, int& outW, int& outH) {
-    const int h = static_cast<int>(names.size()) * rowH;
+    // 行间 kObjRowGap 间距（卡片列表）：总高 = n*rowH + (n-1)*gap
+    const int n = static_cast<int>(names.size());
+    const int h = n * rowH + (n > 1 ? (n - 1) * kObjRowGap : 0);
     if (h <= 0 || width <= 0) return false;
     HDC hdc = CreateCompatibleDC(nullptr);
     if (!hdc) return false;
@@ -812,7 +988,8 @@ bool RasterizeNameList(const std::vector<std::wstring>& names, int width, int ro
     SetTextColor(hdc, RGB(255, 255, 255));
     SetBkMode(hdc, TRANSPARENT);
     for (size_t i = 0; i < names.size(); ++i) {
-        RECT rc{2, static_cast<int>(i) * rowH, width - 2, static_cast<int>(i) * rowH + rowH};
+        const int ry = static_cast<int>(i) * (rowH + kObjRowGap);
+        RECT rc{2, ry, width - 2, ry + rowH};
         DrawTextW(hdc, names[i].c_str(), -1, &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
     SelectObject(hdc, oldFont);
@@ -904,7 +1081,7 @@ void DrawLogicBar(App& app, const Layout& layout) {
 
     VkViewport viewport{0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h), 0.0f, 1.0f};
     vkCmdSetViewport(app.vk.commandBuffer, 0, 1, &viewport);
-    vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipeline);
+    vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipelineUI);
     VkDeviceSize vertexOffset = 0;
     vkCmdBindVertexBuffers(app.vk.commandBuffer, 0, 1, &app.vk.vertexBuffer, &vertexOffset);
 
@@ -930,10 +1107,10 @@ void DrawLogicBar(App& app, const Layout& layout) {
              kBorderColor, 0.0f);
     for (uint32_t i = 0; i < panelCount; ++i) DrawPanel(app, panels[i]);
 
- // 仅触碰（悬停）可拖拽窗口边缘才高亮——顶栏(div 0)不可拖不高亮；
- // 悬停在左栏右缘/右栏左缘/底栏上缘（HitResizeDivider 返回 1/2/3）→ 该边缘画 2px 黄色亮线
+ // 分隔线高亮：仅按下拖拽（app.ui.resizeDrag>=1）才画黄色亮线，悬停不再高亮；
+ // 顶栏(div 0)不可拖不高亮；左栏右缘/右栏左缘/底栏上缘对应 div 1/2/3
     {
-        const int div = HitResizeDivider(app, app.gizmo.mouseX, app.gizmo.mouseY);
+        const int div = app.ui.resizeDrag; // 由悬停检测(HitResizeDivider)改为按下拖拽态
         if (div >= 1) {
             const VkClearColorValue kYellow = {{1.0f, 0.84f, 0.1f, 1.0f}};
             const VkRect2D scissorAll{{0, 0}, {w, h}};
@@ -950,18 +1127,9 @@ void DrawLogicBar(App& app, const Layout& layout) {
         }
     }
 
- // 顶栏按钮高度随栏位变化（上下各留 4px），图标/字符按按钮中心自动居中（图标上限 48px）
-    {
-        const int32_t topH = static_cast<int32_t>(layout.top.extent.height);
-        if (topH > 0) {
-            for (auto& b : app.ui.buttons) {
- if (b.rect.offset.y >= static_cast<int32_t>(kTopBarHeight)) continue; // 仅顶栏按钮
- const int32_t bh = std::max(20, topH - 8); // 上下各留 4px；最小 20
-                b.rect.offset.y = static_cast<int32_t>((topH - bh) / 2);
-                b.rect.extent.height = static_cast<uint32_t>(bh);
-            }
-        }
-    }
+    // 顶栏控件顺位布局（走控件渲染管线）：gear/edit/分隔线/move/rotate/scale 按顺位排列。
+    // 统一按钮 rect、分隔线控件 rect、编辑按钮下拉菜单位置（单一来源）。
+    ComputeTopBar(app, layout);
 
     for (size_t bi = 0; bi < app.ui.buttons.size(); ++bi) {
         const UiButton& btn = app.ui.buttons[bi];
@@ -971,45 +1139,113 @@ void DrawLogicBar(App& app, const Layout& layout) {
             fill.float32[i] = btn.color[i];
             border.float32[i] = btn.border[i];
         }
- // 变换模式按钮（顶栏后 3 个=移动/旋转/缩放）——当前 gizmoMode 激活提亮（视觉反馈）
+ // 变换模式按钮（后 3 个=移动/旋转/缩放，现位于左部）——当前 gizmoMode 激活提亮（视觉反馈）
         if (app.ui.buttons.size() >= 3 && bi >= app.ui.buttons.size() - 3 &&
             static_cast<int>(bi - (app.ui.buttons.size() - 3)) == app.ui.gizmoMode) {
             for (int c = 0; c < 3; ++c)
                 fill.float32[c] = std::min(1.0f, fill.float32[c] * 1.35f + 0.1f);
         }
-        vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipeline);
+        vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipelineUI);
         vkCmdBindVertexBuffers(app.vk.commandBuffer, 0, 1, &app.vk.vertexBuffer, &vertexOffset);
         DrawPanel(app, {btn.rect, fill, btn.radius, border});
- const float iconSize = std::min(static_cast<float>(btn.rect.extent.height) - 6.0f, 48.0f); // 图标上限 48px
-        const float cx = static_cast<float>(btn.rect.offset.x) + btn.rect.extent.width * 0.5f;
+        if (app.vk.textPipeline == VK_NULL_HANDLE) continue;
         const float cy = static_cast<float>(btn.rect.offset.y) + btn.rect.extent.height * 0.5f;
-        const VkRect2D iconRect{
-            {static_cast<int32_t>(cx - iconSize * 0.5f), static_cast<int32_t>(cy - iconSize * 0.5f)},
-            {static_cast<uint32_t>(iconSize), static_cast<uint32_t>(iconSize)}};
-        if (app.vk.textPipeline != VK_NULL_HANDLE) {
- // 顶栏后 3 个按钮（变换模式）= 4/5/6 图标；其余按 btn.icon 选描述集
+        if (bi < 3) {
+            // 顶栏宽按钮（设置/文件/编辑）：16px 小图标左置 + 按钮文字右置（button_labels.txt 可改）
+            const float iconSize = 16.0f;
+            const float ix = static_cast<float>(btn.rect.offset.x) + 10.0f;
+            const VkRect2D iconRect{
+                {static_cast<int32_t>(ix - iconSize * 0.5f), static_cast<int32_t>(cy - iconSize * 0.5f)},
+                {static_cast<uint32_t>(iconSize), static_cast<uint32_t>(iconSize)}};
             VkDescriptorSet set;
-            if (app.ui.buttons.size() >= 3 && bi >= app.ui.buttons.size() - 3) {
-                const int ti = static_cast<int>(bi - (app.ui.buttons.size() - 3));
-                set = app.ui.transformIcons[ti].valid ? app.ui.transformIcons[ti].set : app.vk.textDescriptorSet;
-            } else {
-                set = (btn.icon == 1) ? app.vk.penDescriptorSet : app.vk.textDescriptorSet;
+            if (btn.icon == 1)      set = app.vk.penDescriptorSet;
+            else if (btn.icon == 2) set = app.vk.fileDescriptorSet;
+            else                    set = app.vk.textDescriptorSet;
+            DrawIcon(app, iconRect, kButtonIconColor, set);
+            const App::LabelTexture& lt = app.ui.buttonLabels[bi];
+            if (lt.set != VK_NULL_HANDLE && lt.w > 0 && lt.h > 0) {
+                const VkRect2D tRect{
+                    {static_cast<int32_t>(btn.rect.offset.x) + 30,
+                     static_cast<int32_t>(cy - lt.h * 0.5f)},
+                    {static_cast<uint32_t>(lt.w), static_cast<uint32_t>(lt.h)}};
+                DrawIcon(app, tRect, kButtonIconColor, lt.set);
             }
+        } else {
+            // 左部变换按钮（移动/旋转/缩放）：图标居中
+            const float iconSize = std::min(static_cast<float>(btn.rect.extent.height) - 6.0f, 48.0f);
+            const float cx = static_cast<float>(btn.rect.offset.x) + btn.rect.extent.width * 0.5f;
+            const VkRect2D iconRect{
+                {static_cast<int32_t>(cx - iconSize * 0.5f), static_cast<int32_t>(cy - iconSize * 0.5f)},
+                {static_cast<uint32_t>(iconSize), static_cast<uint32_t>(iconSize)}};
+            const int ti = static_cast<int>(bi - (app.ui.buttons.size() - 3));
+            VkDescriptorSet set = app.ui.transformIcons[ti].valid ? app.ui.transformIcons[ti].set : app.vk.textDescriptorSet;
             DrawIcon(app, iconRect, kButtonIconColor, set);
         }
     }
 
     {
-        const VkRect2D btnBar{{0, 0}, {w, h}};
-        vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipeline);
-        vkCmdBindVertexBuffers(app.vk.commandBuffer, 0, 1, &app.vk.vertexBuffer, &vertexOffset);
- // 顶栏分隔线统一样式修正：编辑按钮右侧分割线与 x=49 灰线同长同色
-        constexpr float kTopDivY0 = 8.0f, kTopDivY1 = 28.0f;
+        // 顶栏图标间分割线（1px 竖直控件，由 ComputeTopBar 计算）
         const VkClearColorValue kTopDivColor{{0.5f, 0.5f, 0.5f, 1.0f}};
-        DrawLine(app, btnBar, 49.0f, kTopDivY0, 49.0f, kTopDivY1, kTopDivColor, 1.0f);
-        if (app.ui.editDividerX > 0 && w >= static_cast<uint32_t>(app.ui.editDividerX) + 4) {
-            DrawLine(app, btnBar, static_cast<float>(app.ui.editDividerX), kTopDivY0,
-                     static_cast<float>(app.ui.editDividerX), kTopDivY1, kTopDivColor, 1.0f);
+        vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipelineUI);
+        vkCmdBindVertexBuffers(app.vk.commandBuffer, 0, 1, &app.vk.vertexBuffer, &vertexOffset);
+        for (const VkRect2D& d : app.ui.topDividers) {
+            if (d.extent.width > 0 && d.extent.height > 0) DrawPanel(app, {d, kTopDivColor, 0.0f});
+        }
+    }
+
+    // 左上角软件图标（纯展示品牌图标，非按钮：仅绘制图标，无悬停/按下高亮背景）
+    {
+        const UiButton& a = app.ui.appIcon;
+        if (app.vk.textPipeline != VK_NULL_HANDLE) {
+            const float iconSize = std::min(static_cast<float>(a.rect.extent.height) - 8.0f, 48.0f);
+            const float cx = static_cast<float>(a.rect.offset.x) + a.rect.extent.width * 0.5f;
+            const float cy = static_cast<float>(a.rect.offset.y) + a.rect.extent.height * 0.5f;
+            const VkRect2D iconRect{{static_cast<int32_t>(cx - iconSize * 0.5f),
+                                     static_cast<int32_t>(cy - iconSize * 0.5f)},
+                                    {static_cast<uint32_t>(iconSize), static_cast<uint32_t>(iconSize)}};
+            DrawIcon(app, iconRect, kButtonIconColor, app.vk.appIconDescriptorSet, false); // false=特殊通道，保留 awa logo 真实颜色
+        }
+    }
+
+ // 3D 视口左上角 3 个圆形按钮与默认按钮一致——先画按钮(底+描边) 再画图标，图标不被描边遮挡
+    UpdateBallButtons(app, layout);
+    {
+        const VkRect2D& bvp = layout.viewport;
+        if (bvp.extent.width > 0 && bvp.extent.height > 0) {
+            for (int i = 0; i < 3; ++i) {
+                const UiButton& b = app.ui.ballButtons[i];
+ // 当前激活的渲染模式球 → 提亮 + 1.5px 黄描边
+                const bool active = (i == 0 && app.ui.renderMode == 1) || (i == 1 && app.ui.renderMode == 0);
+ // hover 状态（标准按钮动画）
+                const bool hover = (b.machine.state == ButtonState::Hover);
+ // 1) 按钮圆底 + 描边（先画；fill 用按钮色，描边黄/主题色；撤销彩虹环恢复统一样式）
+                vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipelineUI);
+                VkDeviceSize off = 0;
+                vkCmdBindVertexBuffers(app.vk.commandBuffer, 0, 1, &app.vk.vertexBuffer, &off);
+                VkClearColorValue fill{};
+                for (int c = 0; c < 4; ++c) fill.float32[c] = b.color[c];
+                if (active) {
+                    for (int c = 0; c < 3; ++c)
+                        fill.float32[c] = std::min(1.0f, fill.float32[c] * 1.4f + 0.15f);
+ const VkClearColorValue yb{{1.0f, 0.84f, 0.1f, 1.0f}}; // 黄边（选中态）
+                    DrawPanel(app, {b.rect, fill, b.radius, yb, 1.5f});
+                } else if (hover) {
+                    const VkClearColorValue hb{{b.border[0], b.border[1], b.border[2], 1}};
+                    DrawPanel(app, {b.rect, fill, b.radius, hb, 1.0f});
+                } else {
+ DrawPanel(app, {b.rect, fill, b.radius, fill, 0.0f}); // 纯底无描边
+                }
+ // 2) 图标叠加（最后画 → 永远在最上层，不被黄边/描边遮挡）
+                if (app.ui.ballIcons[i].valid) {
+ const uint32_t isz = static_cast<uint32_t>(b.rect.extent.width) * 4u / 5u; // 30→24px
+                    const int32_t ix = b.rect.offset.x +
+                                       (static_cast<int32_t>(b.rect.extent.width) - static_cast<int32_t>(isz)) / 2;
+                    const int32_t iy = b.rect.offset.y +
+                                       (static_cast<int32_t>(b.rect.extent.height) - static_cast<int32_t>(isz)) / 2;
+                    const VkRect2D iconRect{{ix, iy}, {isz, isz}};
+                    DrawIcon(app, iconRect, VkClearColorValue{{1, 1, 1, 1}}, app.ui.ballIcons[i].set);
+                }
+            }
         }
     }
 
@@ -1110,54 +1346,14 @@ void DrawLogicBar(App& app, const Layout& layout) {
             DrawLine(app, vp, m1x, m1y, m0x, m1y, bcol, 0.8f);
             DrawLine(app, vp, m0x, m1y, m0x, m0y, bcol, 0.8f);
  // 恢复默认 2D 管线（半透明混合管线仅框选填充用）
-            vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipeline);
+            vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipelineUI);
         }
     }
 
- // 3D 视口左上角 3 个圆形按钮与默认按钮一致——先画按钮(底+描边) 再画图标，图标不被描边遮挡
-    UpdateBallButtons(app, layout);
-    {
-        const VkRect2D& bvp = layout.viewport;
-        if (bvp.extent.width > 0 && bvp.extent.height > 0) {
-            for (int i = 0; i < 3; ++i) {
-                const UiButton& b = app.ui.ballButtons[i];
- // 当前激活的渲染模式球 → 提亮 + 1.5px 黄描边
-                const bool active = (i == 0 && app.ui.renderMode == 1) || (i == 1 && app.ui.renderMode == 0);
- // hover 状态（标准按钮动画）
-                const bool hover = (b.machine.state == ButtonState::Hover);
- // 1) 按钮圆底 + 描边（先画；fill 用按钮色，描边黄/主题色；撤销彩虹环恢复统一样式）
-                vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipeline);
-                VkDeviceSize off = 0;
-                vkCmdBindVertexBuffers(app.vk.commandBuffer, 0, 1, &app.vk.vertexBuffer, &off);
-                VkClearColorValue fill{};
-                for (int c = 0; c < 4; ++c) fill.float32[c] = b.color[c];
-                if (active) {
-                    for (int c = 0; c < 3; ++c)
-                        fill.float32[c] = std::min(1.0f, fill.float32[c] * 1.4f + 0.15f);
- const VkClearColorValue yb{{1.0f, 0.84f, 0.1f, 1.0f}}; // 黄边（选中态）
-                    DrawPanel(app, {b.rect, fill, b.radius, yb, 1.5f});
-                } else if (hover) {
-                    const VkClearColorValue hb{{b.border[0], b.border[1], b.border[2], 1}};
-                    DrawPanel(app, {b.rect, fill, b.radius, hb, 1.0f});
-                } else {
- DrawPanel(app, {b.rect, fill, b.radius, fill, 0.0f}); // 纯底无描边
-                }
- // 2) 图标叠加（最后画 → 永远在最上层，不被黄边/描边遮挡）
-                if (app.ui.ballIcons[i].valid) {
- const uint32_t isz = static_cast<uint32_t>(b.rect.extent.width) * 4u / 5u; // 30→24px
-                    const int32_t ix = b.rect.offset.x +
-                                       (static_cast<int32_t>(b.rect.extent.width) - static_cast<int32_t>(isz)) / 2;
-                    const int32_t iy = b.rect.offset.y +
-                                       (static_cast<int32_t>(b.rect.extent.height) - static_cast<int32_t>(isz)) / 2;
-                    const VkRect2D iconRect{{ix, iy}, {isz, isz}};
-                    DrawIcon(app, iconRect, VkClearColorValue{{1, 1, 1, 1}}, app.ui.ballIcons[i].set);
-                }
-            }
-        }
-    }
 
  // 右侧物体显示栏多物体名称列表，Blender 风格；点击行选中
  // 跟随可调右栏布局（layout 为 ComputeLayout 单一来源）
+ // 方案B 卡片列表控件：面板圆角 8px + 顶部标题条「物体列表」+ 行间 2px 间距
     if (layout.right.extent.width >= 40 && layout.right.extent.height >= 100) {
         const int px = layout.right.offset.x + kObjPanelPad;
         const int py = layout.right.offset.y + kObjPanelPad;
@@ -1166,16 +1362,35 @@ void DrawLogicBar(App& app, const Layout& layout) {
         const VkClearColorValue panelFill = kPanelColor;
         const VkClearColorValue whiteBorder = {{1.0f, 1.0f, 1.0f, 1.0f}};
         const VkClearColorValue selColor = ThemeColor(ui::g_theme.list.selected);
-        vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipeline);
+        vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipelineUI);
         VkDeviceSize off = 0;
         vkCmdBindVertexBuffers(app.vk.commandBuffer, 0, 1, &app.vk.vertexBuffer, &off);
+        // 面板：整体圆角 8px（卡片风格）
         DrawPanel(app, {{{px - kObjPanelPad, py - kObjPanelPad},
                          {static_cast<uint32_t>(pw + 2 * kObjPanelPad), static_cast<uint32_t>(ph)}},
- panelFill, 0.0f, whiteBorder, 1.0f}); // 模型列表面板无圆角
- // 物体栏行级按钮化——每行按按钮渲染（按钮主题色 normal + 悬停提亮 + 选中高亮，圆角行）
+                 panelFill, 8.0f, whiteBorder, 1.0f});
+        // 顶部标题条「物体列表」：深一档底色 + 白字（圆角顶）
+        {
+            const VkRect2D titleRect{{px - kObjPanelPad, py - kObjPanelPad},
+                                     {static_cast<uint32_t>(pw + 2 * kObjPanelPad), static_cast<uint32_t>(kObjTitleH)}};
+            VkClearColorValue tf;
+            for (int c = 0; c < 3; ++c) tf.float32[c] = panelFill.float32[c] * 0.55f;
+            tf.float32[3] = 1.0f;
+            DrawPanel(app, {titleRect, tf, 8.0f, VkClearColorValue{{0, 0, 0, 0}}, 0.0f});
+            if (app.ui.objPanelTitle.set != VK_NULL_HANDLE && app.ui.objPanelTitle.w > 0) {
+                const VkRect2D tRect{
+                    {titleRect.offset.x + (static_cast<int32_t>(titleRect.extent.width) - app.ui.objPanelTitle.w) / 2,
+                     titleRect.offset.y + (kObjTitleH - app.ui.objPanelTitle.h) / 2},
+                    {static_cast<uint32_t>(app.ui.objPanelTitle.w), static_cast<uint32_t>(app.ui.objPanelTitle.h)}};
+                DrawIcon(app, tRect, kButtonIconColor, app.ui.objPanelTitle.set);
+            }
+        }
+ // 物体栏行级按钮化——每行按按钮渲染（按钮主题色 normal + 悬停提亮 + 选中高亮，圆角行，行间 kObjRowGap 间距）
+        const int listY = py - kObjPanelPad + kObjTitleH;
         const int nRows = static_cast<int>(app.scene.objects.size());
         for (int i = 0; i < nRows; ++i) {
-            const VkRect2D rowRect{{px, py + i * kObjPanelRowH},
+            const int ry = listY + i * (kObjPanelRowH + kObjRowGap);
+            const VkRect2D rowRect{{px, ry},
                                    {static_cast<uint32_t>(pw), static_cast<uint32_t>(kObjPanelRowH)}};
             const bool hovered =
                 app.gizmo.mouseX >= static_cast<float>(rowRect.offset.x) &&
@@ -1188,12 +1403,79 @@ void DrawLogicBar(App& app, const Layout& layout) {
  else if (hovered) for (int c = 0; c < 3; ++c) rc.float32[c] = std::min(1.0f, app.ui.buttonTheme.normal[c] * 1.5f + 0.08f); // 悬停提亮
  DrawPanel(app, {rowRect, rc, 4.0f, rc, 0.0f}); // 圆角行（4px）
         }
- // 全部物体名字列表（DrawIcon 内部切换 textPipeline；透明底白字，混合显示）
+ // 全部物体名字列表（DrawIcon 内部切换 textPipeline；透明底白字，混合显示；纹理含 kObjRowGap 行间距）
         if (app.ui.objNameLabel.set != VK_NULL_HANDLE && app.ui.objNameLabel.w > 0) {
-            const VkRect2D listRect{{px, py},
+            const VkRect2D listRect{{px, listY},
                                     {static_cast<uint32_t>(app.ui.objNameLabel.w),
                                      static_cast<uint32_t>(app.ui.objNameLabel.h)}};
             DrawIcon(app, listRect, VkClearColorValue{{0.88f, 0.88f, 0.88f, 1.0f}}, app.ui.objNameLabel.set);
+        }
+    }
+    // 右上角系统按钮（最小化/最大化/关闭，PS 风格；悬停高亮，关闭红底白叉）
+    {
+        vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipelineUI);
+        vkCmdBindVertexBuffers(app.vk.commandBuffer, 0, 1, &app.vk.vertexBuffer, &vertexOffset);
+        for (int i = 0; i < 3; ++i) {
+            const UiButton& s = app.ui.sysButtons[i];
+            const ButtonState st = s.machine.state;
+            // 关闭按钮悬停变红：优先用状态机 Hover/Pressed；本窗口自绘无边框+自定义拖拽，
+            // 状态机 hover 不可靠时，用鼠标实时位置命中兜底，确保"鼠标移到关闭按钮上即变红"。
+            const bool mouseOver = PointInButton(s, app.gizmo.mouseX, app.gizmo.mouseY);
+            const bool closeHover = (i == 2) && (st == ButtonState::Hover || st == ButtonState::Pressed || mouseOver);
+            if (closeHover) {
+                // 关闭按钮悬停/按下：红底
+                const VkClearColorValue red{{0.8f, 0.16f, 0.16f, 1.0f}};
+                DrawPanel(app, {s.rect, red, 0.0f});
+            } else if (st == ButtonState::Pressed) {
+                // 按下状态：颜色变深（×0.55，视觉反馈）
+                VkClearColorValue dark{};
+                for (int c = 0; c < 4; ++c) dark.float32[c] = s.color[c] * 0.55f;
+                DrawPanel(app, {s.rect, dark, 0.0f});
+            } else if (st == ButtonState::Hover) {
+                // 悬停：浅底
+                VkClearColorValue fill{};
+                for (int c = 0; c < 4; ++c) fill.float32[c] = s.color[c];
+                DrawPanel(app, {s.rect, fill, 0.0f});
+            }
+            if (app.vk.textPipeline != VK_NULL_HANDLE) {
+                const float cx = static_cast<float>(s.rect.offset.x) + s.rect.extent.width * 0.5f;
+                const float cy = static_cast<float>(s.rect.offset.y) + s.rect.extent.height * 0.5f;
+                const VkClearColorValue col = (i == 2 && closeHover)
+                    ? VkClearColorValue{{1.0f, 1.0f, 1.0f, 1.0f}}
+                    : (st == ButtonState::Pressed)
+                        ? VkClearColorValue{{0.65f, 0.65f, 0.65f, 1.0f}}  // 按下深灰
+                        : VkClearColorValue{{0.85f, 0.85f, 0.85f, 1.0f}};
+                // Round296：右上角三图标整体缩小、线更细（halfWidth 1.2→0.7）；
+                // 最大化按钮在已最大化时显示"还原"图标（双矩形）以表明当前状态。
+                const float lw = 0.7f;  // 细线
+                if (i == 2) {                       // 关闭：X（半幅 5.0 ≈10px，与最大化方框 r=4.0 协调，不再偏大）
+                    const float gs = 5.0f;
+                    DrawLine(app, s.rect, cx - gs, cy - gs, cx + gs, cy + gs, col, lw);
+                    DrawLine(app, s.rect, cx - gs, cy + gs, cx + gs, cy - gs, col, lw);
+                } else if (i == 1) {                // 最大化按钮：手绘图标（白渲染通道）；已最大化显示"还原"双矩形，否则单矩形
+                    const float r = 4.0f;           // 半幅（#4：方框半幅 5.0→4.0，细线）
+                    const float o = 1.6f;           // 还原图标两矩形偏移量
+                    if (app.ui.maximized) {
+                        // 还原图标：两个重叠矩形（左下在前、右上在后）
+                        DrawLine(app, s.rect, cx + o - r, cy - o - r, cx + o + r, cy - o - r, col, lw);
+                        DrawLine(app, s.rect, cx + o - r, cy - o + r, cx + o + r, cy - o + r, col, lw);
+                        DrawLine(app, s.rect, cx + o - r, cy - o - r, cx + o - r, cy - o + r, col, lw);
+                        DrawLine(app, s.rect, cx + o + r, cy - o - r, cx + o + r, cy - o + r, col, lw);
+                        DrawLine(app, s.rect, cx - o - r, cy + o - r, cx - o + r, cy + o - r, col, lw);
+                        DrawLine(app, s.rect, cx - o - r, cy + o + r, cx - o + r, cy + o + r, col, lw);
+                        DrawLine(app, s.rect, cx - o - r, cy + o - r, cx - o - r, cy + o + r, col, lw);
+                        DrawLine(app, s.rect, cx - o + r, cy + o - r, cx - o + r, cy + o + r, col, lw);
+                    } else {
+                        // 最大化图标：单矩形
+                        DrawLine(app, s.rect, cx - r, cy - r, cx + r, cy - r, col, lw);
+                        DrawLine(app, s.rect, cx - r, cy + r, cx + r, cy + r, col, lw);
+                        DrawLine(app, s.rect, cx - r, cy - r, cx - r, cy + r, col, lw);
+                        DrawLine(app, s.rect, cx + r, cy - r, cx + r, cy + r, col, lw);
+                    }
+                } else {                            // 最小化：底部短线（垂直居中，更小）
+                    DrawLine(app, s.rect, cx - 5.0f, cy, cx + 5.0f, cy, col, lw);
+                }
+            }
         }
     }
 

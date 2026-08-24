@@ -6,14 +6,8 @@
 
 #include <windows.h>
 #include <commdlg.h>
-#include "vulkan_loader.h"
-#include "camera.h"
-#include "model_import.h"
-#include "settings_window.h"
-#include "ui_presets.h"
-#include "app.h"
-#include "ui_button.h"
-#include "import_pipeline.h"
+#include "app.h"  // App/SceneObject/VertexSolid/AAMode；并传递包含 vulkan_loader/camera/model_import/settings_window/ui_presets
+            // （ui_button.h / import_pipeline.h 不再经此间接引入——各自 .cpp 显式 include，避免上帝头）
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -32,6 +26,16 @@
 
 using std::uint32_t;
 
+// 鼠标灵敏度（0~100）↔ orbit/pan 输入增益因子（0.1~2.0，50→1.05 接近中性）
+inline float SensToFactor(int s) {
+    const float c = std::max(0, std::min(100, s)) / 100.0f;
+    return 0.1f + c * 1.9f;
+}
+inline int FactorToSens(float f) {
+    int s = static_cast<int>((f - 0.1f) / 1.9f * 100.0f + 0.5f);
+    return std::max(0, std::min(100, s));
+}
+
 // ============ 共享结构（原 main.cpp 文件级定义）============
 // ---- 界面布局 ----
 // kTopBarHeight / kSideBarWidth / kBottomBarHeight 已移至 app.h（App 默认值 + 拖拽最小限制共用）
@@ -39,6 +43,8 @@ constexpr float kLineWidth = 1.0f;
 // 右侧物体列表Blender 风格多物体编辑栏行高 / 面板内边距（绘制与点击命中共用）
 constexpr int kObjPanelRowH = 22;
 constexpr int kObjPanelPad  = 8;
+constexpr int kObjTitleH    = 24;   // 物体栏顶部标题条高（卡片列表控件，方案B）
+constexpr int kObjRowGap    = 2;    // 物体栏行间距（卡片间距）
 
 // 从 ui::g_theme 预设 COLORREF 转 Vulkan clear color（仅 2D UI 用；3D 视口/轴/gizmo 保持原样）
 inline VkClearColorValue ThemeColor(COLORREF c, float a = 1.0f) {
@@ -104,8 +110,9 @@ static_assert(sizeof(PushConstants) == 80, "push constant 布局需与 GLSL 一�
 struct TextPush {
     float rect[4];
     float color[4];
+    float mono;   // 0=直通彩色（软件图标特殊通道）；1=纯白渲染（按钮图标默认）
 };
-static_assert(sizeof(TextPush) == 32, "TextPush 布局需与 text shader 一致");
+static_assert(sizeof(TextPush) == 36, "TextPush 布局需与 text shader 一致");
 // ---------------------------------------------------------------------------
 constexpr float kDefaultFadeRadius = 150.0f * 1.7f; // 固定默认渲染距离150 x 1.7 = 255
 
@@ -157,16 +164,17 @@ bool CreateInstance(App& app);
 bool CreateMSAAColorResources(App& app);
 bool CreateMenuPipeline(App& app);
 bool CreateOutlineResources(App& app);
-bool CreatePanelBlendPipeline(App& app, VkPipelineLayout layout, VkPipeline& outPipeline);
+bool CreatePanelBlendPipeline(App& app, VkPipelineLayout layout, VkPipeline& outPipeline, VkSampleCountFlagBits samples);
 bool CreatePipeline(App& app);
 bool CreatePipelineAxis(App& app);
+bool CreatePipelineUI(App& app);
 bool CreatePipelineFXAA(App& app);
 bool CreatePipelineGrid(App& app);
 bool CreatePipelineLine3d(App& app);
 bool CreatePipelineOutline(App& app);
 bool CreatePipelineSolid(App& app);
 bool CreateRenderPass(App& app);
-bool CreateRoundedRectPipeline(App& app, VkPipelineLayout& outLayout, VkPipeline& outPipeline);
+bool CreateRoundedRectPipeline(App& app, VkPipelineLayout& outLayout, VkPipeline& outPipeline, VkSampleCountFlagBits samples);
 bool CreateShaderModule(VkDevice device, const unsigned char* code, size_t size, VkShaderModule& module);
 bool CreateSurface(App& app, HINSTANCE hInstance);
 bool CreateSwapchain(App& app, VkSwapchainKHR oldSwapchain = VK_NULL_HANDLE);
@@ -183,10 +191,8 @@ void Cleanup(App& app);
 void CmdImageBarrier(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspect, VkImageLayout oldLayout, VkImageLayout newLayout, VkPipelineStageFlags srcStage, VkAccessFlags srcAccess, VkPipelineStageFlags dstStage, VkAccessFlags dstAccess);
 void DestroyAllPipelines(App& app);
 void EndOneTimeCommand(const App& app, VkCommandBuffer cmd);
-void ImageBarrier(App& app, VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout, VkPipelineStageFlags srcStage, VkAccessFlags srcAccess, VkPipelineStageFlags dstStage, VkAccessFlags dstAccess);
-void ImageBarrierAspect(App& app, VkImage image, VkImageAspectFlags aspect, VkImageLayout oldLayout, VkImageLayout newLayout, VkPipelineStageFlags srcStage, VkAccessFlags srcAccess, VkPipelineStageFlags dstStage, VkAccessFlags dstAccess);
-void TransitionAfterRender(App& app, VkImage image);
-void TransitionBeforeRender(App& app, VkImage image);
+// 图像布局屏障（app 命令缓冲区版）。aspect 默认 COLOR；深度等用途显式传 VK_IMAGE_ASPECT_DEPTH_BIT。
+void ImageBarrier(App& app, VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout, VkPipelineStageFlags srcStage, VkAccessFlags srcAccess, VkPipelineStageFlags dstStage, VkAccessFlags dstAccess, VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT);
 
 // ---- renderer.cpp ----
 void BeginFrameRendering(App& app, uint32_t imageIndex, bool fxaa, const VkClearValue& clearValue, const VkClearValue& depthClear, const VkRect2D& fullArea);
@@ -243,6 +249,11 @@ App* GetApp(HWND hwnd);
 ButtonTheme LoadButtonTheme();
 LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 Layout ComputeLayout(const App& app);
+// 顶栏控件布局（每帧在 DrawLogicBar 中调用）：设置/文件/编辑 宽按钮 + 移动/旋转/缩放 垂直排布左部。
+// 统一按钮/分隔线/菜单位置。
+void ComputeTopBar(App& app, const Layout& layout);
+// 读取 exe 同目录 button_labels.txt 的 label0/label1/label2（UTF-8，外部可改按钮文字），未配置保留默认值
+void LoadButtonLabels(UiButton* buttons, int n);
 bool DecodePngWic(const unsigned char* pngData, size_t pngSize, std::vector<uint8_t>& rgba, int& width, int& height, int targetW = 0, int targetH = 0);
 bool RasterizeNameList(const std::vector<std::wstring>& names, int width, int rowH, std::vector<uint8_t>& rgba, int& outW, int& outH);
 bool RasterizeText(const wchar_t* text, int fontSize, int pad, const wchar_t* fontName, std::vector<uint8_t>& rgba, int& width, int& height);
@@ -253,7 +264,7 @@ int LoadSettingInt(const char* key, int defaultValue);
 std::string TrimStr(const std::string& s);
 void ApplyRename(App& app);
 void CancelRename(App& app);
-void DrawIcon(App& app, const VkRect2D& iconRect, VkClearColorValue color, VkDescriptorSet set);
+void DrawIcon(App& app, const VkRect2D& iconRect, VkClearColorValue color, VkDescriptorSet set, bool white = true);
 void DrawLine(App& app, VkRect2D scissor, float ax, float ay, float bx, float by, VkClearColorValue color, float halfWidth);  void DrawLetter(App& app, VkRect2D scissor, char c, float cx, float cy, float size, VkClearColorValue color);
 void DrawLogicBar(App& app, const Layout& layout);
 void DrawMenu(App& app);
@@ -266,6 +277,7 @@ void UpdateBallButtons(App& app, const Layout& layout);
 void UpdateNavHud(App& app);
 void UpdateObjectLabels(App& app);
 void UploadLabelRgba(App& app, App::LabelTexture& lt, const std::vector<uint8_t>& rgba, int w, int h);  // 比例尺**固定长条 + 移动竖线**——横条长度固定，竖线按相机距离 // （对数映射，范围 0.3~10000 与相机 zoom clamp 一致）左右移动指示当前缩放； // 条上方居中显示当前距离数值（RasterizeText 系统字体，窄字 + 明显字间距） static void DrawScaleBar(App& app, const Layout& layout);
+void FlushPendingLabelUploads(App& app);  // 帧首安全点处理标签纹理延迟上传（消除 DrawFrame 录制中途 2 秒阻塞回归）
 
 // ---- 错误宏（原 main.cpp 定义，拆分后共享；SetError 见 ui3d.cpp）----
 #define VKB_TRY(expr)                                                         \

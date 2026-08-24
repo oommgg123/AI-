@@ -5,6 +5,10 @@
 
 using std::uint32_t;
 
+// 上一帧 vkQueueSubmit 失败后栅栏已未置位且不会自行置位；置位此标志让下一帧跳过 vkWaitForFences，
+// 避免每帧等满 10s 的伪卡死（详见 DrawFrame / EndFrameAndPresent）。
+static bool s_skipFenceWait = false;
+
 void DrawSelectionOutline(App& app, SceneObject& sel, int selIndex, const float mvp[16]) { // 非 const（延迟构建特征边）
     if (app.vk.pipelineLine3d == VK_NULL_HANDLE) return;
  // 缓存失效重建（拓扑不变仅变换时无需重建）
@@ -226,12 +230,14 @@ void DrawCoordHud(App& app, const Layout& layout) {
 void BeginFrameRendering(App& app, uint32_t imageIndex, bool fxaa, const VkClearValue& clearValue, const VkClearValue& depthClear, const VkRect2D& fullArea) {
     if (app.vk.useDynamicRendering) {
         const VkImage swapImage = app.vk.swapchainImages[imageIndex];
-        TransitionBeforeRender(app, swapImage);
-        ImageBarrierAspect(app, app.vk.depthImage, VK_IMAGE_ASPECT_DEPTH_BIT,
-                           VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
-                           VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
-                           VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+        ImageBarrier(app, swapImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+        ImageBarrier(app, app.vk.depthImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                     VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+                     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                     VK_IMAGE_ASPECT_DEPTH_BIT);
         if (fxaa) {
             ImageBarrier(app, app.vk.fxaaImage,
                          VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -374,11 +380,12 @@ void DrawSelectionMaskPass(App& app, const float* mvp, const VkRect2D& fullArea,
                      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                      VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
-        ImageBarrierAspect(app, app.vk.outlineDepthImage, VK_IMAGE_ASPECT_DEPTH_BIT,
-                           VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
-                           VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
-                           VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+        ImageBarrier(app, app.vk.outlineDepthImage,
+                     VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                     VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+                     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                     VK_IMAGE_ASPECT_DEPTH_BIT);
         VkRenderingAttachmentInfo maskColor{};
         maskColor.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
         maskColor.imageView = app.vk.outlineView;
@@ -407,11 +414,9 @@ void DrawSelectionMaskPass(App& app, const float* mvp, const VkRect2D& fullArea,
         const uint32_t n = static_cast<uint32_t>(selObj.solidIndices.size());
         if (n > 0) {
             const int cmode2 = app.scene.vertexColorMode < 0 ? 0 : (app.scene.vertexColorMode > 4 ? 4 : app.scene.vertexColorMode);
-            VkPipeline solidPipe2 = app.vk.pipelineSolidNoColor;
-            if (cmode2 == 1) solidPipe2 = app.vk.pipelineSolid;
-            else if (cmode2 == 2) solidPipe2 = app.vk.pipelineSolid8;
-            else if (cmode2 == 3) solidPipe2 = app.vk.pipelineSolid4;
-            else if (cmode2 == 4) solidPipe2 = app.vk.pipelineSolid1;
+            // mask pass 渲染到 1 采样 outlineImage，必须用 1 采样管线（pipelineSolidMask），
+            // 不能用随 MSAA 变 4 采样的实体管线，否则采样数不匹配导致 GPU 挂起/黑屏
+            VkPipeline solidPipe2 = app.vk.pipelineSolidMask;
             vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, solidPipe2);
             VkDeviceSize off0 = 0;
             vkCmdBindVertexBuffers(app.vk.commandBuffer, 0, 1, &app.vk.vertexBuffer3D, &off0);
@@ -452,7 +457,9 @@ void EndFrameAndPresent(App& app, uint32_t imageIndex) {
 
     const VkImage swapImage = app.vk.swapchainImages[imageIndex];
     if (app.vk.useDynamicRendering) {
-        TransitionAfterRender(app, swapImage);
+        ImageBarrier(app, swapImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                     VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0);
     }
     vkEndCommandBuffer(app.vk.commandBuffer);
 
@@ -466,8 +473,19 @@ void EndFrameAndPresent(App& app, uint32_t imageIndex) {
     submitInfo.pCommandBuffers = &app.vk.commandBuffer;
     submitInfo.signalSemaphoreCount = 1;
     submitInfo.pSignalSemaphores = &app.vk.renderFinished;
-    vkQueueSubmit(app.vk.graphicsQueue, 1, &submitInfo, app.vk.inFlightFence);
+    g_stage = "DrawFrame:submit命令";
+    const VkResult submitRes = vkQueueSubmit(app.vk.graphicsQueue, 1, &submitInfo, app.vk.inFlightFence);
+    if (submitRes != VK_SUCCESS) {
+        // 防御：submit 失败 → renderFinished 信号量永不被置位 → 紧接着的 vkQueuePresentKHR 会无限阻塞
+        // （Vulkan present 无超时），主线程冻结、黑屏、只能任务管理器强杀。故 submit 失败直接跳过呈现。
+        // 同时置 s_skipFenceWait，使下一帧跳过 vkWaitForFences（栅栏已未置位且不会自行置位），
+        // 避免每帧等满 10s 的伪卡死；循环继续存活，日志持续记录 submit 错误便于定位。
+        s_skipFenceWait = true;
+        { static int s_dfz=0; if(s_dfz<4){++s_dfz; VkbLog(("[df] submit res="+std::to_string((int)submitRes)+" -> return").c_str());} }
+        return;
+    }
 
+    { static int s_df4=0; if(s_df4<4){++s_df4; VkbLog("[df] post-submit ok");} }
     VkPresentInfoKHR presentInfo{};
     presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     presentInfo.waitSemaphoreCount = 1;
@@ -475,16 +493,15 @@ void EndFrameAndPresent(App& app, uint32_t imageIndex) {
     presentInfo.swapchainCount = 1;
     presentInfo.pSwapchains = &app.vk.swapchain;
     presentInfo.pImageIndices = &imageIndex;
+    g_stage = "DrawFrame:present呈现";
     const VkResult presentResult = g_pfnQueuePresentKHR(app.vk.graphicsQueue, &presentInfo);
     if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR) {
         app.resizePending = true;
+    { static int s_df5=0; if(s_df5<4){++s_df5; VkbLog(("[df] post-present res="+std::to_string((int)presentResult)).c_str());} }
     }
 }
 void DrawFrame(App& app) {
-    const uint64_t tFrameStart = GetTickCount64();
-    static uint64_t s_lastFrameLog = 0;
-    static uint64_t s_frameNo = 0;
-    ++s_frameNo;
+    { static int s_de=0; if(s_de<4){++s_de; VkbLog("[df] enter");} }
     g_stage = "DrawFrame:交换链/acquire";
     if (app.resizePending && app.vk.swapchain != VK_NULL_HANDLE) {
         RECT cr{};
@@ -492,23 +509,48 @@ void DrawFrame(App& app) {
         const uint32_t cw = static_cast<uint32_t>(cr.right - cr.left);
         const uint32_t ch = static_cast<uint32_t>(cr.bottom - cr.top);
         app.resizePending = false;
-        if (cw == 0 || ch == 0) return;
+        if (cw == 0 || ch == 0) {
+            return;
+        }
         if (cw != app.vk.swapchainExtent.width || ch != app.vk.swapchainExtent.height) {
-            if (!RecreateSwapchain(app)) return;
+            if (!RecreateSwapchain(app)) {
+                return;
+            }
         }
     }
-    if (app.vk.swapchainExtent.width == 0 || app.vk.swapchainExtent.height == 0) return;
+    if (app.vk.swapchainExtent.width == 0 || app.vk.swapchainExtent.height == 0) {
+        // 交换链尺寸异常（驱动在 init 期把 currentExtent 报成 0 等）→ 触发重建以获取有效尺寸，
+        // 而非每帧静默 return 导致整窗永久黑屏；并记一次性日志便于复现诊断。
+        app.resizePending = true;
+        return;
+    }
 
- // 有限超时(2s)替代 UINT64_MAX——设备丢失/命令未完成时不再永久阻塞主线程（"卡死"根因之一）。
- // 非 SUCCESS（超时/DEVICE_LOST/…）即跳过本帧，保持消息循环存活 → UI 不冻结；设备恢复后自动继续。
-    VkResult fenceRes = vkWaitForFences(app.vk.device, 1, &app.vk.inFlightFence, VK_TRUE, 2000000000ull);
-    if (fenceRes != VK_SUCCESS) return;
+ // 有限超时(100ms)替代 2s/无限——设备丢失/命令未完成时不再长时间阻塞主线程（手感优化）。
+ // 超时即跳过本帧（记录原因与等待毫秒），保持消息循环存活 → UI 不冻结；下一帧重试。
+ // s_skipFenceWait：上一帧 vkQueueSubmit 失败后栅栏已处于未置位且不会自行置位，若仍硬等 10s 会每帧假死；
+ // 故失败后下一帧直接跳过等待，避免"黑屏+只能任务管理器"的伪卡死（日志已记录 submit 错误）。
+    g_stage = "DrawFrame:等待inFlight栅栏";
+    VkResult fenceRes = VK_SUCCESS;
+    if (s_skipFenceWait) {
+        s_skipFenceWait = false;   // 本帧不再等待，直接继续录制/提交
+    } else {
+        fenceRes = vkWaitForFences(app.vk.device, 1, &app.vk.inFlightFence, VK_TRUE, 10000000ull);
+        if (fenceRes != VK_SUCCESS) {
+            { static int s_dfx=0; if(s_dfx<4){++s_dfx; VkbLog(("[df] fence-wait res="+std::to_string((int)fenceRes)+" -> return").c_str());} }
+            return;
+        }
+    }
+
+ // 帧首安全点：处理 DrawFrame 录制中途（缩放改距离条 / 平移改坐标标签）暂存的标签纹理上传，
+ // 避免在命令缓冲录制中途阻塞 2 秒（#215 回归根因：旧 UploadLabelRgba 在此 vkWaitForFences(inFlightFence,2s)，
+ // 当时该栅栏已复位、当前帧未提交→卡满 2 秒）。此处上一帧已结束、当前帧未录制，销毁/重建纹理安全。
+    { static int s_df2=0; if(s_df2<4){++s_df2; VkbLog("[df] post-fence ok");} }
+    FlushPendingLabelUploads(app);
 
     uint32_t imageIndex = 0;
- // 有限超时(2s)替代 UINT64_MAX——呈现引擎无法提供图像窗口未可见/交换链失效/
- // 前帧设备丢失未恢复时不再永久阻塞主线程（"卡死无操作输出"的另一个根因）。
- // 超时即跳过本帧，保持消息循环存活；下一帧重试，设备/交换链恢复后自动继续渲染。
-    VkResult result = g_pfnAcquireNextImageKHR(app.vk.device, app.vk.swapchain, 2000000000ull,
+ // 有限超时(100ms)替代 2s/无限——呈现引擎无法提供图像/交换链失效时不再长时间阻塞（手感优化）。
+    g_stage = "DrawFrame:acquire图像";
+    VkResult result = g_pfnAcquireNextImageKHR(app.vk.device, app.vk.swapchain, 10000000ull,
                                                app.vk.imageAvailable, VK_NULL_HANDLE, &imageIndex);
     if (result == VK_ERROR_OUT_OF_DATE_KHR) {
         RecreateSwapchain(app);
@@ -516,10 +558,13 @@ void DrawFrame(App& app) {
     }
     if (result == VK_TIMEOUT || result == VK_ERROR_SURFACE_LOST_KHR ||
         result == VK_ERROR_DEVICE_LOST) {
- // 无法取得图像——本帧跳过，绝不阻塞；保持 UI 响应。
         return;
     }
-    if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) return;
+    if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
+        { static int s_dfy=0; if(s_dfy<4){++s_dfy; VkbLog(("[df] acquire res="+std::to_string((int)result)+" -> return").c_str());} }
+        return;
+    }
+    { static int s_df3=0; if(s_df3<4){++s_df3; VkbLog(("[df] post-acquire ok idx="+std::to_string(imageIndex)).c_str());} }
     vkResetFences(app.vk.device, 1, &app.vk.inFlightFence);
 
     vkResetCommandBuffer(app.vk.commandBuffer, 0);
@@ -1001,10 +1046,5 @@ void DrawFrame(App& app) {
     g_stage = "DrawFrame:逻辑栏/2D";
     DrawLogicBar(app, layout);
 
-    if (s_frameNo - s_lastFrameLog >= 60 || s_frameNo == 1) {
-        s_lastFrameLog = s_frameNo;
-        const uint64_t ms = GetTickCount64() - tFrameStart;
-        VkbLog(("[frame] #" + std::to_string(s_frameNo) + " 耗时=" + std::to_string(ms) + "ms g_stage=" + (g_stage ? g_stage : "null")).c_str());
-    }
     EndFrameAndPresent(app, imageIndex);
 }

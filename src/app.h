@@ -20,7 +20,8 @@
 
 // ---- Round358：面板布局默认尺寸（App 字段默认值 + 分隔线拖拽最小限制共用；ComputeLayout 单一来源）----
 constexpr uint32_t kTopBarHeight    = 36;    // 顶栏高（默认=最小）
-constexpr uint32_t kSideBarWidth    = 160;   // 左/右栏宽（默认=最小）
+constexpr uint32_t kSideBarWidth    = 160;   // 右栏宽（默认=最小）
+constexpr uint32_t kLeftBarWidth    = 53;    // 左栏宽（160/3，缩小 3 倍；仅容 30px 按钮+留白）
 constexpr uint32_t kBottomBarHeight = 150;   // 底部面板高（默认=最小）
 
 // ---- 按钮交互状态机（唯一的状态转换入口）----
@@ -41,7 +42,12 @@ struct ButtonStateMachine {
     }
 
     void OnMouseMove(bool inside) {
-        if (state == ButtonState::Pressed) return;
+        if (state == ButtonState::Pressed) {
+            // 按下中鼠标移出按钮区域 → 立即取消按下高亮（移回恢复 Pressed），
+            // 配合按钮按下 SetCapture：鼠标移出窗口后状态不再滞留、动画不再停止。
+            state = inside ? ButtonState::Pressed : ButtonState::Normal;
+            return;
+        }
         if (inside) {
             if (state == ButtonState::Normal || state == ButtonState::Released) state = ButtonState::Hover;
         } else {
@@ -81,6 +87,7 @@ struct UiButton {
     float radius = 4.0f;
     void (*onClick)(App&) = nullptr;
     int icon = 0;
+    std::wstring label;              // 按钮内文字（设置/文件/编辑；来自 button_labels.txt，外部可改）
 };
 
 // ---- 无限地面网格（Grid push 160B；Draw 声明在此，定义见 main.cpp）----
@@ -128,6 +135,9 @@ struct App {
         VkDescriptorSet set = VK_NULL_HANDLE;
         int w = 0, h = 0;
         std::wstring text;
+        std::vector<uint8_t> pendingRgba;   // 延迟上传暂存（避免 DrawFrame 录制中途阻塞，见 FlushPendingLabelUploads）
+        int pendingW = 0, pendingH = 0;
+        bool needsUpload = false;
     };
 
     // ================= Vulkan 上下文（句柄/管线/资源/同步）=================
@@ -156,7 +166,8 @@ struct App {
         std::vector<VkImageView> swapchainImageViews;
 
         VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
-        VkPipeline pipeline = VK_NULL_HANDLE;
+        VkPipeline pipeline = VK_NULL_HANDLE;          // 3D pass 用（视口背景/坐标轴十字），采样数随 MSAA
+        VkPipeline pipelineUI = VK_NULL_HANDLE;        // 2D 面板 UI pass 用（渲染到 1 采样 swapchain），固定 1 采样
         VkBuffer vertexBuffer = VK_NULL_HANDLE;
         VkDeviceMemory vertexBufferMemory = VK_NULL_HANDLE;
 
@@ -196,6 +207,17 @@ struct App {
         VkImageView penView = VK_NULL_HANDLE;
         VkDescriptorSet penDescriptorSet = VK_NULL_HANDLE;
 
+        VkImage fileImage = VK_NULL_HANDLE;
+        VkDeviceMemory fileMemory = VK_NULL_HANDLE;
+        VkImageView fileView = VK_NULL_HANDLE;
+        VkDescriptorSet fileDescriptorSet = VK_NULL_HANDLE;
+
+        // 软件图标（awa logo，从 icon.ico 提取 PNG 嵌入；复用 textDescriptorPool）
+        VkImage appIconImage = VK_NULL_HANDLE;
+        VkDeviceMemory appIconMemory = VK_NULL_HANDLE;
+        VkImageView appIconView = VK_NULL_HANDLE;
+        VkDescriptorSet appIconDescriptorSet = VK_NULL_HANDLE;
+
         VkImage importImage = VK_NULL_HANDLE;
         VkDeviceMemory importMemory = VK_NULL_HANDLE;
         VkImageView importView = VK_NULL_HANDLE;
@@ -212,6 +234,7 @@ struct App {
         VkPipeline pipelineSolid8 = VK_NULL_HANDLE;        // 8bit 颜色
         VkPipeline pipelineSolid4 = VK_NULL_HANDLE;        // 4bit 颜色
         VkPipeline pipelineSolid1 = VK_NULL_HANDLE;        // 1bit 颜色
+        VkPipeline pipelineSolidMask = VK_NULL_HANDLE;     // 描边 mask pass 专用（固定 1 采样，渲染到 1x outlineImage）
 
         // ---- 3D 物体选中/线框（Blender 风格）----
         VkPipelineLayout pipelineLayoutLine3d = VK_NULL_HANDLE;
@@ -278,7 +301,7 @@ struct App {
     struct UiState {
         // 面板可调尺寸（拖分隔线调整；min=默认值，max 保证视口 >=60px；ComputeLayout 读取）
         uint32_t panelTopH = kTopBarHeight;         // 顶栏高（可拖 36↑）
-        uint32_t panelLeftW = kSideBarWidth;        // 左栏宽（可拖 160↑）
+        uint32_t panelLeftW = kLeftBarWidth;        // 左栏宽（可拖 53↑；移动/旋转/缩放垂直按钮条）
         uint32_t panelRightW = kSideBarWidth;       // 右栏宽（可拖 160↑）
         uint32_t panelBottomH = kBottomBarHeight;   // 底部面板高（可拖 150↑）
         int resizeDrag = -1;                        // 分隔线拖拽：0=顶栏下缘 1=左栏右缘 2=右栏左缘 3=底栏上缘；-1=无
@@ -288,7 +311,21 @@ struct App {
         ButtonTheme buttonTheme;
         std::vector<UiButton> buttons;
         int pressedButton = -1;
-        int editDividerX = 0;   // 编辑按钮右侧竖直分割线 x 坐标（0=未设置）
+
+        // 顶栏自绘控件（无边框全屏窗口模式：软件图标 + 窗口控制按钮 + 分割线）
+        UiButton appIcon;                    // 左上角软件图标（特殊按钮，无边框；复用齿轮图标）
+        UiButton sysButtons[3];              // 右上角：最小化/最大化/关闭（PS 风格）
+        std::vector<VkRect2D> topDividers;   // 顶栏图标间竖直分割线（ComputeTopBar 计算，DrawLogicBar 绘制）
+        bool maximized = false;              // 当前是否全屏铺满主显示器
+        bool minimized = false;              // 当前是否最小化（最小化期间停止渲染，避免交换链操作崩溃）
+        bool captionDragging = false;        // 标题栏拖拽中（自定义拖拽：SetCapture 后由 WM_MOUSEMOVE 移动窗口）
+        bool edgeResizing = false;           // 边缘缩放中（自定义缩放：1=左 2=右 3=底 4=左下 5=右下）
+        int  resizeEdge = 0;                 // 当前缩放边缘（0=无）
+        int  dragStartX = 0, dragStartY = 0; // 拖拽起点（屏幕坐标，取自 WM_NCLBUTTONDOWN 的 lParam）
+        RECT dragOrigRect{0, 0, 0, 0};       // 拖拽起点窗口矩形（屏幕坐标）
+        bool appIconDown = false;            // 软件图标按下中
+        int pressedSys = -1;                 // 按下的系统按钮索引（0=最小化 1=最大化 2=关闭）
+        RECT normalRect{0, 0, 0, 0};         // 还原（非全屏）时的窗口矩形
 
         // 3D 视口左上角 3 个圆形按钮（标准按钮动画；矩形随布局每帧同步）
         UiButton ballButtons[3];
@@ -320,9 +357,11 @@ struct App {
 
         // 物体显示栏文字标签（选中变化时 RasterizeText→纹理重建）
         LabelTexture objNameLabel;   // 当前物体名称
+        LabelTexture objPanelTitle;  // 右部物体栏标题条文字（"物体列表"，卡片控件方案B）
         LabelTexture scaleLabel;     // 缩放条数值文字（系统默认字体 Segoe UI）
         LabelTexture importUpLabel;  // GPU 上传中提示文字（"正在上传渲染数据…"）
         LabelTexture coordLabels[3] = {};   // 摄像机坐标 X/Y/Z 文字
+        LabelTexture buttonLabels[3] = {};  // 顶栏宽按钮文字（设置/文件/编辑；button_labels.txt 可改）
         uint64_t objLabelThrottleMs = 0;   // 标签重建节流（避免拖动时每帧上传纹理）
 
         // 缩放距离显示（zoom→距离条淡入；停止 0.5s 淡出）

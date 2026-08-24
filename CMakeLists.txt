@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 # 版本号单一来源（用户 179 轮：不硬编码）——更新版本只需改这里的 VERSION（major.minor.patch）
-project(vulkan-blank VERSION 1.258.0 LANGUAGES CXX)
+project(vulkan-blank VERSION 1.259.0 LANGUAGES CXX)
 
 # 纯 Vulkan API 应用（Vulkan 1.0+ 双渲染路径 / C++20 / GPU 圆角矩形绘制）
 # 仅依赖 Vulkan 头文件/库 + 构建期 glslc，无任何第三方库
@@ -228,6 +228,7 @@ endif()
 
 add_executable(vulkan-blank WIN32
     src/main.cpp
+    src/platform/win32/PlatformWin32.cpp
     src/vulkan_init.cpp
     src/renderer.cpp
     src/picking.cpp
@@ -235,12 +236,13 @@ add_executable(vulkan-blank WIN32
     src/ui3d.cpp
     src/vulkan_loader.cpp
     src/settings_window.cpp
+    src/ui_controls.cpp
     src/camera.cpp
     src/model_import.cpp
     src/import_pipeline.cpp
     src/import_window.cpp
     src/ui_button.cpp
-    src/gdi_util.cpp
+    src/ui2d.cpp
     src/mc_blocks.cpp
     src/mc_map_pipeline.cpp
     assets/icon.rc

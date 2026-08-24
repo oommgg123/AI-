@@ -1,14 +1,15 @@
 // ============================================================================
-//   共享 GDI 工具（用户 2026-08-19：消除 settings / import / MC 三个 GDI 窗口
-//   逐字复制的窗口类注册 + 双缓冲 DC 脚手架）
+//   共享 2D 抽象层 ui2d（P3：由 gdi_util 重命名而来，namespace gdi → ui2d）
+//   消除 settings / import / MC 三个 GDI 窗口逐字复制的窗口类注册 + 双缓冲 DC 脚手架：
 //   - RegisterWindowClass：统一注册 CS_HREDRAW|CS_VREDRAW + 默认光标 + 背景刷 + 可选图标
 //   - DoubleBuffer：双缓冲内存 DC（CreateCompatibleDC / CreateCompatibleBitmap / BitBlt 封装）
+//   跨平台预留：未来非 Windows 后端只需提供等价 ui2d 实现，上层零改动。
 // ============================================================================
 #pragma once
 
 #include <windows.h>
 
-namespace gdi {
+namespace ui2d {
 
 // 注册一个标准 GDI 窗口类。返回 RegisterClassExW 的 ATOM（失败为 0）。
 // hIcon / hIconSm 传 nullptr 则窗口无图标。
@@ -26,4 +27,4 @@ struct DoubleBuffer {
 DoubleBuffer CreateDoubleBuffer(HDC hdc, int w, int h);
 void FreeDoubleBuffer(DoubleBuffer& db);
 
-}  // namespace gdi
+}  // namespace ui2d

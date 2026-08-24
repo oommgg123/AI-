@@ -6,8 +6,10 @@
 #include <algorithm>
 #include <cmath>
 
-#include "gdi_util.h"    // 共享 GDI 工具：RegisterWindowClass / DoubleBuffer（消除逐字复制的脚手架）
+#include "ui2d.h"    // 共享 GDI 工具：RegisterWindowClass / DoubleBuffer（消除逐字复制的脚手架）
 #include "ui_presets.h"  // 统一控件预设体系：所有样式参数（颜色/圆角/间距/控件尺寸）从 ui::g_theme 取值
+#include "ui_controls.h"  // 顺位布局 / 控件管理器（专用有序布局）
+#include "awa_internal.h"  // ApplyAAMode / SaveSettingInt / SensToFactor（事件驱动直写 App）
 
 namespace {
 
@@ -29,8 +31,19 @@ const COLORREF kScrollTrack     = ui::g_theme.slider.track;      // 滚动条轨
 const COLORREF kScrollThumb     = ui::g_theme.palette.scrollBar; // 滚动条滑块
 const COLORREF kTrackColor      = ui::g_theme.slider.track;      // 滑条轨道底色
 const COLORREF kTrackFill       = ui::g_theme.slider.fill;       // 滑条已填充段（accent）
+
+// 两色线性混合（t∈[0,1]，0=全 a，1=全 b）
+static COLORREF BlendColor(COLORREF a, COLORREF b, float t) {
+    return RGB(
+        static_cast<BYTE>(GetRValue(a) + (GetRValue(b) - GetRValue(a)) * t),
+        static_cast<BYTE>(GetGValue(a) + (GetGValue(b) - GetGValue(a)) * t),
+        static_cast<BYTE>(GetBValue(a) + (GetBValue(b) - GetBValue(a)) * t));
+}
+// 列表未选中行被鼠标触碰时的加深底色：行色→选中色之间取 ~40%，保证"加深但不强于选中"
+const COLORREF kHoverRowColor = BlendColor(kRowColor, kSelectedColor, 0.40f);
 const COLORREF kThumbRing       = ui::g_theme.slider.knobBorder; // 滑块外圈
 const COLORREF kThumbWhite      = ui::g_theme.slider.knob;       // 滑块纯白
+const COLORREF kYellowBorder    = RGB(255, 215, 26);             // 列表选中项 1px 黄边
 
 // ---- 抗锯齿下拉列表布局（"现代化自定义外观"，用户 172 轮：整体容器背景 + 可滚动）----
 const int kPad        = ui::g_theme.spacing.padX;   // 外边距（原 10 → 预设 12）
@@ -44,13 +57,11 @@ constexpr int kScrollbarW = 8;   // 滚动条宽度（无对应预设字段，�
 constexpr int kAACount    = 5;   // AA 模式数量（可增长：>5 时列表右侧自动出现滚动条）
 
 // ---- 摄像机阻尼滑动条布局（用户 168 轮："自定义现代化滑动条"；169 轮整体上移 100px）----
-constexpr int kDampY  = 150;   // 滑动条区域顶部 y（上移后：150；远离展开的下拉列表 10..197）
 constexpr int kLabelW = 190;   // 左侧标签"摄像机当前阻尼： **"宽度
 constexpr int kTrackW = 300;   // 轨道宽度（布局尺寸，不接预设）
 const int kTrackH     = ui::g_theme.slider.h;     // 轨道高度（原 6 → 预设 8）
 const int kThumbR     = ui::g_theme.slider.knobR; // 圆形滑块半径（原 12 → 预设 9）
 // ---- 鼠标滑动灵敏度滑动条布局（用户 2026-08-20：在摄像机阻尼下方）----
-constexpr int kSensY   = kDampY + 60;   // 灵敏度条区域顶部 y（阻尼条下方，留足间距）
 
 constexpr const wchar_t* kAANames[5] = {
     L"无（关闭抗锯齿）",
@@ -62,6 +73,13 @@ constexpr const wchar_t* kAANames[5] = {
 
 HWND g_settingsWindow = nullptr;
 HWND g_owner = nullptr;
+App* g_settingsApp = nullptr;     // 当前设置窗口持有的 App 引用（事件驱动直写，替代每帧轮询全局）
+
+// 从 App 当前值读取设置窗口显示所需的整数（0~100 / 模式索引）
+static int CurAa()   { return g_settingsApp ? static_cast<int>(g_settingsApp->aa.aaMode) : 3; }
+static int CurDamp() { return g_settingsApp ? static_cast<int>(g_settingsApp->camera.damping * 100.0f + 0.5f) : 5; }
+static int CurSens() { return g_settingsApp ? FactorToSens(g_settingsApp->camera.orbitSensitivity) : 50; }
+
 HFONT g_font = nullptr;           // 微软雅黑（缓存，避免每次重绘创建）
 
 // Round372：按钮 hover 状态（-1=无，0=header，1..kMaxVisible=opt0..optN-1）——与主窗口按钮管线对齐
@@ -84,7 +102,7 @@ HBRUSH g_scrollThumbBrush = nullptr;
 HFONT  g_smallFont = nullptr;
 HBRUSH g_bgBrush   = nullptr;
 // 双缓冲 DC（惰性缓存，尺寸变化时重建）
-gdi::DoubleBuffer g_db{};
+ui2d::DoubleBuffer g_db{};
 bool g_listOpen = false;
 bool g_dragging = false;          // 阻尼滑块拖动中（SetCapture 后跟随鼠标）
 bool g_draggingSens = false;      // 鼠标灵敏度滑块拖动中（SetCapture 后跟随鼠标）
@@ -101,41 +119,83 @@ constexpr UINT_PTR kAnimTimerId = 1;
 constexpr float kListExpandSec   = 0.075f;  // 展开时长 75ms（用户 175 轮：加速 2 倍，原 150ms）
 constexpr float kListCollapseSec = 0.06f;   // 收起时长 60ms（用户 175 轮：加速 2 倍，原 120ms）
 
-// 阻尼条像素位置（轨道水平范围 / 滑块中心 y）
-int TrackLeft()  { return kPad + kLabelW; }
-int TrackRight() { return TrackLeft() + kTrackW; }
-int DampCenterY(){ return kDampY + kThumbR; }
+// ---- 顺位布局：控件管理器（ui_controls）+ 单一来源 rect ----
+static ui::ControlManager g_mgr;
+enum {
+    ID_HEADER = 1, ID_LIST, ID_DAMP_ROW, ID_SENS_ROW, ID_SPACER, ID_BOTTOM,
+    ID_DAMP_LABEL, ID_DAMP_TRACK, ID_SENS_LABEL, ID_SENS_TRACK
+};
 
-// 鼠标 x → 阻尼值（0~100），实时写全局 g_cameraDamping（主循环检测差异后应用+保存）
+// 顺位布局：每次需要坐标时重建注册并算力（~10 控件，开销可忽略）。规则：
+//  - 主组"settings"竖向 = header → list → 阻尼行 → 灵敏度行 → 弹性 spacer → 底部文字
+//  - 阻尼行/灵敏度行是横向子组（label 固定宽 + track 弹性填满）
+//  - list 高度随展开动画 g_listAnim 渐变；关闭时高度 0（顺位自动收拢后续控件）
+static void RecomputeSettingsLayout(HWND hwnd) {
+    RECT cr; GetClientRect(hwnd, &cr);
+    RECT area = cr; InflateRect(&area, -kPad, -kPad);   // 外边距
+    const int maxH  = kMaxVisible * (kItemH + kItemGap);
+    const int listH = (g_listOpen || g_listAnim > 0.001f)
+        ? std::max(1, static_cast<int>(maxH * g_listAnim + 0.5f)) : 0;
+    g_mgr.reset();
+    // 主组（竖向）
+    g_mgr.add({"settings", 0, ui::Axis::Vertical,   ui::Anchor::None, kPad, kItemH,      kContainerW,       0, ID_HEADER});
+    g_mgr.add({"settings", 1, ui::Axis::Vertical,   ui::Anchor::None, 0,    listH,        kContainerW,       0, ID_LIST});
+    g_mgr.add({"settings", 2, ui::Axis::Vertical,   ui::Anchor::None, 12,   2*kThumbR+8,  kLabelW + kTrackW, 0, ID_DAMP_ROW,  false, "damp-row"});
+    g_mgr.add({"settings", 3, ui::Axis::Vertical,   ui::Anchor::None, 8,    2*kThumbR+8,  kLabelW + kTrackW, 0, ID_SENS_ROW,  false, "sens-row"});
+    g_mgr.add({"settings", 4, ui::Axis::Vertical,   ui::Anchor::None, 0,    -1,           -1,               1, ID_SPACER,    true});
+    g_mgr.add({"settings", 5, ui::Axis::Vertical,   ui::Anchor::None, 0,    24,           -1,               0, ID_BOTTOM});
+    // 阻尼行（横向）
+    g_mgr.add({"damp-row", 0, ui::Axis::Horizontal, ui::Anchor::None, 0,    kLabelW,      -1,               0, ID_DAMP_LABEL});
+    g_mgr.add({"damp-row", 1, ui::Axis::Horizontal, ui::Anchor::None, 0,    -1,           -1,               1, ID_DAMP_TRACK});
+    // 灵敏度行（横向）
+    g_mgr.add({"sens-row", 0, ui::Axis::Horizontal, ui::Anchor::None, 0,    kLabelW,      -1,               0, ID_SENS_LABEL});
+    g_mgr.add({"sens-row", 1, ui::Axis::Horizontal, ui::Anchor::None, 0,    -1,           -1,               1, ID_SENS_TRACK});
+    g_mgr.compute(area);
+}
+
+// 安全取控件 rect 封装
+static const ui::Ctrl* C(const std::string& g, int id) { return g_mgr.find(g, id); }
+
+int TrackLeft()  { const auto* c = C("damp-row", ID_DAMP_TRACK); return c ? c->rect.left  : kPad + kLabelW; }
+int TrackRight() { const auto* c = C("damp-row", ID_DAMP_TRACK); return c ? c->rect.right : kPad + kLabelW + kTrackW; }
+int DampCenterY(){ const auto* c = C("damp-row", ID_DAMP_TRACK); return c ? (c->rect.top + c->rect.bottom) / 2 : 0; }
+int SensCenterY(){ const auto* c = C("sens-row", ID_SENS_TRACK); return c ? (c->rect.top + c->rect.bottom) / 2 : 0; }
+
+// 鼠标 x → 阻尼值（0~100），实时写 App.camera.damping + 保存（事件驱动，不再经全局轮询）
 void UpdateDampingFromX(int x) {
     const int left = TrackLeft(), right = TrackRight();
     float t = (right > left) ? static_cast<float>(x - left) / static_cast<float>(right - left) : 0.0f;
     int v = static_cast<int>(t * 100.0f + 0.5f);
     v = std::max(0, std::min(100, v));
-    g_cameraDamping = v;
+    if (g_settingsApp) {
+        g_settingsApp->camera.damping = v / 100.0f;
+        SaveSettingInt("camera_damping", v);
+    }
 }
 
-// 灵敏度条滑块中心 y
-int SensCenterY(){ return kSensY + kThumbR; }
-
-// 鼠标 x → 灵敏度值（0~100），实时写全局 g_mouseSensitivity（主循环检测差异后应用+保存）
+// 鼠标 x → 灵敏度值（0~100），实时写 App.camera.orbitSensitivity + 保存（事件驱动，不再经全局轮询）
 void UpdateSensitivityFromX(int x) {
     const int left = TrackLeft(), right = TrackRight();
     float t = (right > left) ? static_cast<float>(x - left) / static_cast<float>(right - left) : 0.0f;
     int v = static_cast<int>(t * 100.0f + 0.5f);
     v = std::max(0, std::min(100, v));
-    g_mouseSensitivity = v;
+    if (g_settingsApp) {
+        g_settingsApp->camera.orbitSensitivity = SensToFactor(v);
+        SaveSettingInt("mouse_sensitivity", v);
+    }
 }
 
 RECT GetHeaderRect() {
-    return { kPad, kPad, kPad + kContainerW, kPad + kItemH };
+    const auto* c = C("settings", ID_HEADER);
+    return c ? c->rect : RECT{kPad, kPad, kPad + kContainerW, kPad + kItemH};
 }
 
 // 列表**整体容器**（用户 172 轮：有容器背景；固定显示 kMaxVisible 行，内容可增长）
 RECT GetListContainerRect() {
-    const int top = kPad + kItemH + kItemGap;  // header 下沿
-    const int h = kMaxVisible * (kItemH + kItemGap);  // 固定容器高（5 行）
-    return { kPad, top, kPad + kContainerW, top + h };
+    const auto* c = C("settings", ID_LIST);
+    if (c) return c->rect;
+    const int top = kPad + kItemH + kItemGap;
+    return { kPad, top, kPad + kContainerW, top + kMaxVisible * (kItemH + kItemGap) };
 }
 
 // 可见行矩形（visibleRow = 0..kMaxVisible-1，对应内容索引 g_scrollOffset + visibleRow）
@@ -251,6 +311,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                                    CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"微软雅黑");
         return 0;
     case WM_PAINT: {
+        RecomputeSettingsLayout(hwnd);  // 顺位布局：绘制前按当前窗口尺寸重算所有控件 rect
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
         RECT full;
@@ -261,8 +322,8 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         // 完成后 BitBlt 一次性上屏——避免 GDI 逐个图元绘制造成的中间态闪烁。
         // 内存 DC/位图惰性缓存（尺寸变化时重建），避免每次重绘反复 CreateCompatibleDC/Bitmap。
         if (!g_db.dc || g_db.w != cw || g_db.h != ch) {
-            gdi::FreeDoubleBuffer(g_db);
-            g_db = gdi::CreateDoubleBuffer(hdc, cw, ch);
+            ui2d::FreeDoubleBuffer(g_db);
+            g_db = ui2d::CreateDoubleBuffer(hdc, cw, ch);
         }
         HDC memDc = g_db.dc;
 
@@ -288,9 +349,9 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         HBRUSH hdrOldBrush = static_cast<HBRUSH>(SelectObject(memDc, hdrBrush));
         HPEN   hdrOldPen   = static_cast<HPEN>(SelectObject(memDc, g_borderPen));
         RoundRect(memDc, hdr.left, hdr.top, hdr.right, hdr.bottom, kCornerD, kCornerD);
-        // active（列表展开）：黄边（1.5px，模拟主窗口 active 状态）
-        if (g_listOpen) {
-            const HPEN yb = CreatePen(PS_SOLID, 2, RGB(255, 215, 26));
+        // 下拉 header：仅鼠标触碰(hover)才 1px 黄边；未触碰列表（含收起态）不黄亮
+        if (g_hoverButton == 0) {
+            const HPEN yb = CreatePen(PS_SOLID, 1, kYellowBorder);
             HPEN ybOld = static_cast<HPEN>(SelectObject(memDc, yb));
             HBRUSH nb = static_cast<HBRUSH>(GetStockObject(NULL_BRUSH));
             HBRUSH nbOld = static_cast<HBRUSH>(SelectObject(memDc, nb));
@@ -306,7 +367,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         RECT textRect = hdr;
         textRect.left += kTextPad;
         SetTextColor(memDc, kTextSel);
-        DrawTextW(memDc, kAANames[g_selectedAaMode], -1, &textRect,
+        DrawTextW(memDc, kAANames[CurAa()], -1, &textRect,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         // 恢复后续代码使用的 brush/pen（原顺序：borderPen+btnBrush）
         SelectObject(memDc, g_borderPen);
@@ -338,16 +399,17 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             const int trackTop = cy - kTrackH / 2;
             // 左侧标签：摄像机当前阻尼： **
             wchar_t label[64];
-            wsprintfW(label, L"摄像机当前阻尼： %d", g_cameraDamping);
+            wsprintfW(label, L"摄像机当前阻尼： %d", CurDamp());
             SetTextColor(memDc, kTextSel);
-            RECT lr{ kPad, kDampY, kPad + kLabelW, kDampY + 2 * kThumbR };
+            const auto* dl = C("damp-row", ID_DAMP_LABEL);
+            RECT lr = dl ? dl->rect : RECT{kPad, 0, kPad + kLabelW, 0};
             DrawTextW(memDc, label, -1, &lr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             // 轨道背景（圆角，深灰）
             SelectObject(memDc, g_trackPen);
             SelectObject(memDc, g_trackBrush);
             RoundRect(memDc, left, trackTop, right, trackTop + kTrackH, 3, 3);
             // 已填充段（轨道左端 → 滑块中心）
-            const int thumbX = left + static_cast<int>(g_cameraDamping / 100.0f * kTrackW + 0.5f);
+            const int thumbX = left + static_cast<int>(CurDamp() / 100.0f * kTrackW + 0.5f);
             SelectObject(memDc, g_fillBrush);
             RoundRect(memDc, left, trackTop, thumbX, trackTop + kTrackH, 3, 3);
             // 圆形滑块：外圈浅灰（"一丝透明边"）+ 内圈纯白
@@ -369,16 +431,17 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             const int trackTop = cy - kTrackH / 2;
             // 左侧标签：鼠标滑动灵敏度： **
             wchar_t label[64];
-            wsprintfW(label, L"鼠标滑动灵敏度： %d", g_mouseSensitivity);
+            wsprintfW(label, L"鼠标滑动灵敏度： %d", CurSens());
             SetTextColor(memDc, kTextSel);
-            RECT lr{ kPad, kSensY, kPad + kLabelW, kSensY + 2 * kThumbR };
+            const auto* sl = C("sens-row", ID_SENS_LABEL);
+            RECT lr = sl ? sl->rect : RECT{kPad, 0, kPad + kLabelW, 0};
             DrawTextW(memDc, label, -1, &lr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             // 轨道背景（圆角，深灰）
             SelectObject(memDc, g_trackPen);
             SelectObject(memDc, g_trackBrush);
             RoundRect(memDc, left, trackTop, right, trackTop + kTrackH, 3, 3);
             // 已填充段（轨道左端 → 滑块中心）
-            const int thumbX = left + static_cast<int>(g_mouseSensitivity / 100.0f * kTrackW + 0.5f);
+            const int thumbX = left + static_cast<int>(CurSens() / 100.0f * kTrackW + 0.5f);
             SelectObject(memDc, g_fillBrush);
             RoundRect(memDc, left, trackTop, thumbX, trackTop + kTrackH, 3, 3);
             // 圆形滑块：外圈浅灰（"一丝透明边"）+ 内圈纯白
@@ -397,8 +460,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         //       174 轮：展开/收起动画——容器高度按 g_listAnim 从 0 长到满，内容从顶部逐行露出）----
         if (g_listOpen || g_listAnim > 0.001f) {
             const RECT c = GetListContainerRect();
-            const int maxH = c.bottom - c.top;
-            const int curH = static_cast<int>(maxH * g_listAnim + 0.5f);
+            const int curH = c.bottom - c.top;  // 容器 rect 已含展开动画高度，直接用它裁剪
             if (curH >= 1) {
                 const int savedDc = SaveDC(memDc);
                 // 裁剪到动画高度（内容被裁剪，产生"从 header 向下展开"效果）
@@ -415,12 +477,37 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 for (int row = 0; row < visible; ++row) {
                     const int opt = g_scrollOffset + row;
                     const RECT r = GetOptionRect(row);
-                    const bool selected = (opt == g_selectedAaMode);
-                DrawRow(memDc, r, selected ? kSelectedColor : kRowColor,
-                        selected ? 2 : 1, g_borderPen, g_btnBrush);
+                    const bool selected = (opt == CurAa());
+                    const bool hovered  = (g_hoverButton == row + 1);  // 本行被鼠标触碰
+                    if (selected) {
+                        // 选中：与未选中行同底色(kRowColor) + 1px 白边（白色高亮；方框与行严格对齐，消除偏移/浮空感）
+                        const HPEN   hPen    = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
+                        const HPEN   hPenOld = static_cast<HPEN>(SelectObject(memDc, hPen));
+                        const HBRUSH hBr     = CreateSolidBrush(kRowColor);
+                        const HBRUSH hBrOld  = static_cast<HBRUSH>(SelectObject(memDc, hBr));
+                        Rectangle(memDc, r.left, r.top, r.right, r.bottom);
+                        SelectObject(memDc, hPenOld);
+                        SelectObject(memDc, hBrOld);
+                        DeleteObject(hPen);
+                        DeleteObject(hBr);
+                    } else if (hovered) {
+                        // 未选中但被触碰：1px 白边 + 加深底色（kHoverRowColor，弱于选中态）
+                        const HPEN   hPen    = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
+                        const HPEN   hPenOld = static_cast<HPEN>(SelectObject(memDc, hPen));
+                        const HBRUSH hBr     = CreateSolidBrush(kHoverRowColor);
+                        const HBRUSH hBrOld  = static_cast<HBRUSH>(SelectObject(memDc, hBr));
+                        RoundRect(memDc, r.left, r.top, r.right, r.bottom, 2, 2);
+                        SelectObject(memDc, hPenOld);
+                        SelectObject(memDc, hBrOld);
+                        DeleteObject(hPen);
+                        DeleteObject(hBr);
+                    } else {
+                        DrawRow(memDc, r, kRowColor, 1, g_borderPen, g_btnBrush);
+                    }
                     RECT tr = r;
                     tr.left += kTextPad;
-                    SetTextColor(memDc, selected ? kTextSel : kTextDim);
+                    // 其余未选中选项文字改为白色；选中项保持主题正文色
+                    SetTextColor(memDc, selected ? kTextSel : RGB(255, 255, 255));
                     DrawTextW(memDc, kAANames[opt], -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
                 }
                 // 3) 滚动条（内容 > 可见数时出现）
@@ -471,6 +558,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         return 0;
     }
     case WM_LBUTTONDOWN: {
+        RecomputeSettingsLayout(hwnd);  // 顺位布局：点击命中测试前重算 rect
         const int x = static_cast<short>(LOWORD(lParam));
         const int y = static_cast<short>(HIWORD(lParam));
         const POINT pt{ x, y };
@@ -512,7 +600,10 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 if (opt >= kAACount) break;
                 const RECT r = GetOptionRect(row);
                 if (PtInRect(&r, pt)) {
-                    g_selectedAaMode = opt;
+                    if (g_settingsApp) {
+                        const bool ok = ApplyAAMode(*g_settingsApp, static_cast<AAMode>(opt));
+                        if (!ok) VkbLog("[aa] 抗锯齿切换失败，保持当前模式");
+                    }
                     CollapseList();  // 选择后收起（带动画）
                     return 0;
                 }
@@ -544,6 +635,8 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 return 0;
             }
         }
+        // 列表展开时点击别处（非 header/列表项/滚动条/滑块）→ 收起列表
+        if (g_listOpen) CollapseList();
         return 0;
     }
     // 不擦背景（用户 170 轮"滑条滑动还会闪烁"）：双缓冲已覆盖全客户区，
@@ -551,6 +644,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     case WM_ERASEBKGND:
         return 1;
     case WM_MOUSEMOVE: {
+        RecomputeSettingsLayout(hwnd);  // 顺位布局：hover 命中测试前重算 rect
         if (g_scrollDragging) {
             // 滚动条 thumb 拖动：按鼠标位移换算滚动偏移
             const RECT t = GetScrollTrackRect();
@@ -656,7 +750,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     case WM_DESTROY:
         KillTimer(hwnd, kAnimTimerId);
         // 释放缓存的 GDI 对象与双缓冲 DC
-        gdi::FreeDoubleBuffer(g_db);
+        ui2d::FreeDoubleBuffer(g_db);
         DeleteObject(g_borderPen);          g_borderPen = nullptr;
         DeleteObject(g_btnBrush);           g_btnBrush = nullptr;
         DeleteObject(g_arrowPen);           g_arrowPen = nullptr;
@@ -688,20 +782,14 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
 }
 
-int g_selectedAaMode = 3;
-
-int g_cameraDamping = 5;  // 摄像机阻尼（0~100，默认 5 → camera.damping=0.05 低阻尼跟手，用户 170 轮）
-
-int g_mouseSensitivity = 50;  // 鼠标滑动灵敏度（0~100，默认 50 → orbitSensitivity≈1.05，用户 2026-08-20）
-
 wchar_t g_renderBottomText[160] = L"";
 
-HWND OpenSettingsWindow(HWND owner, int currentAaMode) {
+HWND OpenSettingsWindow(HWND owner, App& app) {
     if (g_settingsWindow && IsWindow(g_settingsWindow)) {
         SetForegroundWindow(g_settingsWindow);
         return g_settingsWindow;
     }
-    g_selectedAaMode = currentAaMode;
+    g_settingsApp = &app;
     g_listOpen = false;
     g_dragging = false;
     g_draggingSens = false;
@@ -713,7 +801,7 @@ HWND OpenSettingsWindow(HWND owner, int currentAaMode) {
     static bool registered = false;
     if (!registered) {
         // 复用共享 GDI 窗口类注册（消除逐字复制的 WNDCLASSEXW 脚手架）
-        gdi::RegisterWindowClass(kSettingsClassName, SettingsWndProc, kDefaultPanelRgb,
+        ui2d::RegisterWindowClass(kSettingsClassName, SettingsWndProc, kDefaultPanelRgb,
                                  CreateGearIcon(), CreateGearIcon());
         registered = true;
     }
@@ -736,4 +824,5 @@ void CloseSettingsWindow() {
         DestroyWindow(g_settingsWindow);
         g_settingsWindow = nullptr;
     }
+    g_settingsApp = nullptr;
 }

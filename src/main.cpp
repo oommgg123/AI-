@@ -25,8 +25,15 @@
 #include "ui_presets.h" // 统一控件预设体系：2D UI 面板/描边/图标颜色从 ui::g_theme 取值
 #include "resource.h" // 嵌入的球按钮图标 RCDATA 资源 ID
 #include "awa_internal.h"
+#include "platform/Platform.h"  // GHOST-lite：窗口/表面 OS 边界收口
+
+// 主窗口 platform:: 句柄（P1 创建于 CreateWindowApp；WndProc 内窗口操作统一走此全局，
+// 避免每次从 HWND 反查 Window*）。定义在文件末尾 CreateWindowApp 之前，此处前向声明。
+extern platform::Window* g_mainWindow;
 #include <gear_png.inc>
 #include <pen_png.inc>
+#include <file_png.inc>
+#include <awa_png.inc>
 #include <import_png.inc>
 #include <export_png.inc>
 
@@ -34,7 +41,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <thread>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -74,6 +83,9 @@ constexpr uint32_t kWindowHeight = 600;
 std::string g_error;
 
 const char* g_stage = "启动前";
+
+// 按钮文字字体：优先私有加载 资源/NotoSansSC-Regular.otf（OFL 开源），失败回退系统微软雅黑
+static wchar_t g_buttonFontName[64] = L"微软雅黑";
 
 void SetError(const std::string& msg) {
     if (g_error.empty()) {
@@ -308,7 +320,11 @@ static void DuplicateSelectedObject(App& app) {
     CreateVertexBuffer3D(app);
 }
 
+// 全屏/还原切换（定义见 CreateWindowApp 之后）
+static void ToggleMaximize(App& app);
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    { static int s_wm=0; if(s_wm<160){++s_wm; VkbLog(("[wmsg] "+std::to_string((unsigned)msg)+" wp="+std::to_string((unsigned long long)wParam)).c_str());} }
     switch (msg) {
     case WM_CLOSE:
     case WM_DESTROY:
@@ -324,30 +340,71 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (App* app = GetApp(hwnd)) {
             const uint32_t w = static_cast<uint32_t>(LOWORD(lParam));
             const uint32_t h = static_cast<uint32_t>(HIWORD(lParam));
-            if (w != app->vk.swapchainExtent.width || h != app->vk.swapchainExtent.height) {
-                app->resizePending = true;
+            if (wParam == SIZE_MINIMIZED) {
+                // 最小化：标记并停止渲染，避免最小化窗口上继续操作交换链导致驱动崩溃
+                app->ui.minimized = true;
+            } else {
+                app->ui.minimized = false;
+                // Round296：maximized 由"窗口是否正好铺满工作区"推导，不再依赖 wParam。
+                // 主窗口为 WS_POPUP 无 WS_MAXIMIZE 样式，程序化 SetWindowPos 最大化后系统
+                // 只发 SIZE_RESTORED，旧逻辑会把 maximized 误清 → 最大化按钮"有时失效/无法还原"。
+                // 改为与真实几何比较：铺满工作区即视为最大化，NCHITTEST 边缘缩放据此开关。
+                RECT wr{}; platform::GetWindowRect(g_mainWindow, &wr);
+                RECT mw{}, wk{}; platform::GetWindowMonitorRect(g_mainWindow, &mw, &wk);
+                const bool atWork = (wr.left == wk.left && wr.top == wk.top &&
+                                     (wr.right - wr.left) == (wk.right - wk.left) &&
+                                     (wr.bottom - wr.top) == (wk.bottom - wk.top));
+                app->ui.maximized = atWork;
+                if (w != app->vk.swapchainExtent.width || h != app->vk.swapchainExtent.height) {
+                    app->resizePending = true;
+                }
             }
-            if (wParam != SIZE_MINIMIZED && w > 0 && h > 0 && app->vk.swapchain != VK_NULL_HANDLE) {
-                DrawFrame(*app);
-            }
+            // 修复：不在 WM_SIZE 内同步渲染。拖拽/缩放时 Windows 洪水般发 WM_SIZE，
+            // 每帧同步跑整帧 Vulkan 会饿死消息泵 → 窗口"无响应"；首次显示亦可能在 WM_SIZE
+            // 内重入 RecreateSwapchain 触发驱动死锁。改为仅由主循环统一渲染（DrawFrame 已处理 resize）。
+
         }
         return 0;
- case WM_SETCURSOR: // 悬停可拖拽分隔线/拖拽中 -> Windows 缩放光标（随方向：水平线=上下箭头 IDC_SIZENS / 垂直线=左右箭头 IDC_SIZEWE）
+ case WM_SETCURSOR: // 悬停即显示对应光标（不依赖 DefWindowProc）：分隔线缩放 / 边缘缩放含四角斜线 / 移动区手势
         if (App* app = GetApp(hwnd)) {
             POINT pt{};
             GetCursorPos(&pt);
-            ScreenToClient(hwnd, &pt);
+            platform::ScreenToClient(g_mainWindow, &pt);
+            // 1) 面板分隔线（32645=IDC_SIZENS 上下箭头 / 32644=IDC_SIZEWE 左右箭头）
             const int div = (app->ui.resizeDrag >= 0)
                                 ? app->ui.resizeDrag
                                 : HitResizeDivider(*app, static_cast<float>(pt.x), static_cast<float>(pt.y));
             if (div >= 0) {
- // 32645=IDC_SIZENS（上下箭头） 32644=IDC_SIZEWE（左右箭头）；工程无 UNICODE 需用 W 版宏
                 const int cid = (div == 0 || div == 3) ? 32645 : 32644;
                 SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(cid)));
                 return TRUE;
             }
+            // 2) 窗口边缘缩放（与 NCHITTEST 同一几何；四角用斜线光标 32642/32643）
+            const float cxe = static_cast<float>(pt.x);
+            const float cye = static_cast<float>(pt.y);
+            const int We = static_cast<int>(app->vk.swapchainExtent.width);
+            const int He = static_cast<int>(app->vk.swapchainExtent.height);
+            if (cye >= static_cast<float>(app->ui.panelTopH) && We > 0 && He > 0) {
+                const int bz = 6;
+                const bool left   = cxe <  bz;
+                const bool right  = cxe >  We - bz;
+                const bool bottom = cye >  He - bz;
+                int cid = 0;
+                if (bottom && left)        cid = 32643;  // IDC_SIZENESW 左下↗右上斜线
+                else if (bottom && right)  cid = 32642;  // IDC_SIZENWSE 右下↖左上斜线
+                else if (left || right)    cid = 32644;  // IDC_SIZEWE
+                else if (bottom)           cid = 32645;  // IDC_SIZENS
+                if (cid) { SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(cid))); return TRUE; }
+            }
+            // 3) 窗口移动检测区（顶栏最上 9px 空白，NCHITTEST 返回 HTCAPTION）→ 手势（32649=IDC_HAND）
+            if (wParam == HTCAPTION) {
+                static int dbgCursor = 0;
+                if (dbgCursor++ < 10) VkbLog("[dbg] SETCURSOR HTCAPTION");
+                SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32649)));
+                return TRUE;
+            }
         }
- return DefWindowProc(hwnd, msg, wParam, lParam); // 非分隔线：默认箭头（本函数所有 case 均 return，不用 break）
+ return DefWindowProc(hwnd, msg, wParam, lParam); // 其余：默认箭头（本函数所有 case 均 return，不用 break）
     case WM_KEYDOWN:
         if (App* app = GetApp(hwnd)) {
             const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
@@ -416,6 +473,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 for (int i = 0; i < 2; ++i) {
                     if (app->ui.menuItems[i].machine.OnMouseDown(PointInButton(app->ui.menuItems[i], mx, my))) {
                         app->ui.pressedMenuItem = i;
+                        platform::SetCapture(g_mainWindow);  // 捕获鼠标：移出窗口后释放左键仍可达，动画不滞留
                         return 0;
                     }
                 }
@@ -438,8 +496,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                       (divider == 1) ? app->ui.panelLeftW :
                                       (divider == 2) ? app->ui.panelRightW : app->ui.panelBottomH;
                 app->scene.mouseDragged = true;
-                SetCapture(hwnd);
+                platform::SetCapture(g_mainWindow);
                 return 0;
+            }
+            // 左上角软件图标（特殊按钮，无边框）→ 打开设置
+            if (app->ui.appIcon.machine.OnMouseDown(PointInButton(app->ui.appIcon, mx, my))) {
+                app->ui.appIconDown = true;
+                app->ui.menuOpen = false;
+                platform::SetCapture(g_mainWindow);
+                return 0;
+            }
+            // 右上角系统按钮：最小化/最大化/关闭（按下记录，松开会触发动作）
+            {
+                int sysHit = -1;
+                for (int i = 0; i < 3; ++i) {
+                    if (app->ui.sysButtons[i].machine.OnMouseDown(PointInButton(app->ui.sysButtons[i], mx, my))) {
+                        sysHit = i;
+                        break;
+                    }
+                }
+                if (sysHit >= 0) {
+                    app->ui.pressedSys = sysHit;
+                    platform::SetCapture(g_mainWindow);  // 捕获鼠标确保 LBUTTONUP 可靠到达（即使微移）
+                    return 0;
+                }
             }
             int hit = -1;
             for (size_t i = 0; i < app->ui.buttons.size(); ++i) {
@@ -450,18 +530,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             if (hit >= 0) {
                 app->ui.pressedButton = hit;
+                platform::SetCapture(g_mainWindow);  // 捕获鼠标：按钮动画不因移出窗口而停滞
                 if (app->ui.buttons[hit].icon != 1) app->ui.menuOpen = false;
             } else {
                 app->ui.menuOpen = false;
+                // 顶栏空白（非控件）→ 不触发 orbit/拾取（拖拽/还原由 WM_NCHITTEST 处理）
+                if (my < static_cast<float>(app->ui.panelTopH)) return 0;
  // 右侧物体列表点击选中Blender 风格多物体编辑栏；跟随可调右栏布局
+ // 方案B：列表区起点在标题条（kObjTitleH）之下，行步进含 kObjRowGap 间距
                 const Layout layR = ComputeLayout(*app);
                 if (layR.right.extent.width >= 40 && layR.right.extent.height >= 100) {
                     const int px = layR.right.offset.x + kObjPanelPad;
-                    const int py = layR.right.offset.y + kObjPanelPad;
+                    const int py = layR.right.offset.y + kObjPanelPad + kObjTitleH;
                     const int pw = static_cast<int>(layR.right.extent.width) - 2 * kObjPanelPad;
-                    const int ph = static_cast<int>(layR.right.extent.height) - 2 * kObjPanelPad;
+                    const int ph = static_cast<int>(layR.right.extent.height) - 2 * kObjPanelPad - kObjTitleH;
                     if (mx >= px && mx < px + pw && my >= py && my < py + ph) {
-                        const int row = static_cast<int>((my - py) / kObjPanelRowH);
+                        const int row = static_cast<int>((my - py) / (kObjPanelRowH + kObjRowGap));
                         if (row >= 0 && row < static_cast<int>(app->scene.objects.size())) {
  // 已选中同一行 → 取消选择；否则选中该行单选清空框选多选
                             app->ui.multiSel.clear();
@@ -481,6 +565,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 for (int i = 0; i < 3; ++i) {
                     if (app->ui.ballButtons[i].machine.OnMouseDown(PointInButton(app->ui.ballButtons[i], mx, my))) {
                         app->ui.pressedBall = i;
+                        platform::SetCapture(g_mainWindow);
  app->scene.mouseDragged = true; // 屏蔽松开时的物体拾取
                         return 0;
                     }
@@ -519,7 +604,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                             }
                         }
                         app->scene.mouseDragged = true;
-                        SetCapture(hwnd);
+                        platform::SetCapture(g_mainWindow);
                         return 0;
                     }
                 }
@@ -535,7 +620,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         app->gizmo.gizmoStartSx = so.sx; app->gizmo.gizmoStartSy = so.sy; app->gizmo.gizmoStartSz = so.sz;
                         app->scene.pressX = mx; app->scene.pressY = my;
                         app->scene.mouseDragged = true;
-                        SetCapture(hwnd);
+                        platform::SetCapture(g_mainWindow);
                         return 0;
                     }
                 }
@@ -565,7 +650,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
  app->scene.pressX = mx; // 记录按下位置（区分点击/拖拽）
                         app->scene.pressY = my;
  app->scene.mouseDragged = true; // 三向标按下即视为拖拽：松开时不重新拾取（防误取消选中）
-                        SetCapture(hwnd);
+                        platform::SetCapture(g_mainWindow);
                         return 0;
                     }
                 }
@@ -578,16 +663,51 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
  app->scene.pressX = mx; // 记录按下位置（区分点击/拖拽）
                 app->scene.pressY = my;
                 app->scene.mouseDragged = false;
-                SetCapture(hwnd);
+                platform::SetCapture(g_mainWindow);
             }
         }
         return 0;
     case WM_LBUTTONUP:
         if (App* app = GetApp(hwnd)) {
+ // 自定义标题栏拖拽结束：释放捕获 + 边缘吸附（仅 Win10- 自实现；Win11+ 由系统原生 Snap 处理）
+            if (app->ui.captionDragging) {
+                app->ui.captionDragging = false;
+                platform::ReleaseCapture();
+                if (!platform::IsWindows11OrLater()) {
+                    RECT wr{}, mw{}, wk{};
+                    platform::GetWindowRect(g_mainWindow, &wr);
+                    platform::GetWindowMonitorRect(g_mainWindow, &mw, &wk);
+                    const int snap = 12;
+                    if (wr.top <= mw.top + snap) {
+                        platform::GetWindowRect(g_mainWindow, &app->ui.normalRect);
+                        app->ui.maximized = true;
+                        platform::SetWindowPos(g_mainWindow, nullptr, wk.left, wk.top,
+                                     wk.right - wk.left, wk.bottom - wk.top,
+                                     SWP_NOZORDER | SWP_FRAMECHANGED);
+                    } else if (wr.left <= mw.left + snap) {
+                        platform::SetWindowPos(g_mainWindow, nullptr, wk.left, wk.top,
+                                     (wk.right - wk.left) / 2, wk.bottom - wk.top,
+                                     SWP_NOZORDER | SWP_FRAMECHANGED);
+                    } else if (wr.right >= mw.right - snap) {
+                        const int hw = (wk.right - wk.left) / 2;
+                        platform::SetWindowPos(g_mainWindow, nullptr, wk.right - hw, wk.top,
+                                     hw, wk.bottom - wk.top,
+                                     SWP_NOZORDER | SWP_FRAMECHANGED);
+                    }
+                }
+                return 0;
+            }
+ // 自定义边缘缩放结束：仅释放捕获（尺寸已在 WM_MOUSEMOVE 实时更新）
+            if (app->ui.edgeResizing) {
+                app->ui.edgeResizing = false;
+                app->ui.resizeEdge    = 0;
+                platform::ReleaseCapture();
+                return 0;
+            }
  // 分隔线拖拽结束（尺寸已实时更新）
             if (app->ui.resizeDrag >= 0) {
                 app->ui.resizeDrag = -1;
-                ReleaseCapture();
+                platform::ReleaseCapture();
  // 拖拽结束 → 面板尺寸写入 awa_settings.txt（顶栏固定不保存；下次启动恢复左/右/底）
                 SaveSettingInt("panel_left_w", static_cast<int>(app->ui.panelLeftW));
                 SaveSettingInt("panel_right_w", static_cast<int>(app->ui.panelRightW));
@@ -642,6 +762,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (app->ui.pressedBall >= 0) {
                 const int idx = app->ui.pressedBall;
                 app->ui.pressedBall = -1;
+                platform::ReleaseCapture();  // 与 LBUTTONDOWN 的 SetCapture 配对
                 const float ux = MouseX(lParam);
                 const float uy = MouseY(lParam);
                 const bool inside = PointInButton(app->ui.ballButtons[idx], ux, uy);
@@ -655,6 +776,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (app->ui.pressedMenuItem >= 0) {
                 const int idx = app->ui.pressedMenuItem;
                 app->ui.pressedMenuItem = -1;
+                platform::ReleaseCapture();  // 与 LBUTTONDOWN 的 SetCapture 配对
                 const float ux = MouseX(lParam);
                 const float uy = MouseY(lParam);
                 const bool inside = PointInButton(app->ui.menuItems[idx], ux, uy);
@@ -664,6 +786,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (app->ui.pressedButton >= 0) {
                 const int idx = app->ui.pressedButton;
                 app->ui.pressedButton = -1;
+                platform::ReleaseCapture();  // 与 LBUTTONDOWN 的 SetCapture 配对
                 const float ux = MouseX(lParam);
                 const float uy = MouseY(lParam);
                 const bool inside = PointInButton(app->ui.buttons[idx], ux, uy);
@@ -675,6 +798,31 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         app->ui.gizmoMode = idx - (static_cast<int>(app->ui.buttons.size()) - 3);
                     }
                     if (app->ui.buttons[idx].onClick) app->ui.buttons[idx].onClick(*app);
+                }
+            }
+            // 软件图标释放 → 打开设置（onClick）
+            if (app->ui.appIconDown) {
+                app->ui.appIconDown = false;
+                platform::ReleaseCapture();  // 与 LBUTTONDOWN 的 SetCapture 配对
+                const float ux = MouseX(lParam);
+                const float uy = MouseY(lParam);
+                const bool inside = PointInButton(app->ui.appIcon, ux, uy);
+                app->ui.appIcon.machine.OnMouseUp(inside);
+                if (inside && app->ui.appIcon.onClick) app->ui.appIcon.onClick(*app);
+            }
+            // 系统按钮释放 → 最小化/最大化/关闭
+            if (app->ui.pressedSys >= 0) {
+                const int idx = app->ui.pressedSys;
+                app->ui.pressedSys = -1;
+                platform::ReleaseCapture();  // 释放鼠标捕获（与 LBUTTONDOWN 的 SetCapture 配对）
+                const float ux = MouseX(lParam);
+                const float uy = MouseY(lParam);
+                const bool inside = PointInButton(app->ui.sysButtons[idx], ux, uy);
+                app->ui.sysButtons[idx].machine.OnMouseUp(inside);
+                if (inside) {
+                    if (idx == 0) platform::ShowWindow(g_mainWindow, SW_MINIMIZE);
+                    else if (idx == 1) ToggleMaximize(*app);
+                    else if (idx == 2) platform::DestroyWindow(g_mainWindow);  // → WM_DESTROY → PostQuitMessage
                 }
             }
  // 左键 = 移动视角（orbit，原中键功能）——松开结束 orbit 视角拖动
@@ -704,7 +852,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
             }
         }
-        ReleaseCapture();
+        platform::ReleaseCapture();
         return 0;
     case WM_MBUTTONDOWN:
         if (App* app = GetApp(hwnd)) {
@@ -717,7 +865,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
  app->scene.pressX = app->ui.marqueeX0; // 记录按下位置（区分点击/框选拖拽）
             app->scene.pressY = app->ui.marqueeY0;
             app->scene.mouseDragged = false;
-            SetCapture(hwnd);
+            platform::SetCapture(g_mainWindow);
         }
         return 0;
     case WM_MBUTTONUP:
@@ -769,7 +917,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
  // 框太小（中键单击）→ 不框选、不拾取（中键语义=框选工具，单击无效）
             }
         }
-        ReleaseCapture();
+        platform::ReleaseCapture();
         return 0;
     case WM_RBUTTONDOWN:
         if (App* app = GetApp(hwnd)) {
@@ -777,15 +925,53 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             app->camera.panning = true;
             app->camera.lastX = MouseX(lParam);
             app->camera.lastY = MouseY(lParam);
-            SetCapture(hwnd);
+            platform::SetCapture(g_mainWindow);
         }
         return 0;
     case WM_RBUTTONUP:
         if (App* app = GetApp(hwnd)) app->camera.panning = false;
-        ReleaseCapture();
+        platform::ReleaseCapture();
         return 0;
     case WM_MOUSEMOVE:
         if (App* app = GetApp(hwnd)) {
+            // 自定义标题栏拖拽：移动窗口（不依赖 DefWindowProc 原生模态循环）
+            if (app->ui.captionDragging) {
+                POINT p{}; GetCursorPos(&p);
+                const int dx = p.x - app->ui.dragStartX;
+                const int dy = p.y - app->ui.dragStartY;
+                const int nx = app->ui.dragOrigRect.left + dx;
+                const int ny = app->ui.dragOrigRect.top  + dy;
+                platform::SetWindowPos(g_mainWindow, nullptr, nx, ny, 0, 0,
+                                       SWP_NOSIZE | SWP_NOZORDER);
+                return 0;
+            }
+            // 自定义边缘缩放：按边缘调整窗口尺寸（实时更新，释放时不再重算尺寸）
+            if (app->ui.edgeResizing) {
+                static int dbgResize = 0;
+                if (dbgResize++ < 5)
+                    VkbLog(("[dbg] RESIZE edge=" + std::to_string(app->ui.resizeEdge)).c_str());
+                POINT p{}; GetCursorPos(&p);
+                const int dx = p.x - app->ui.dragStartX;
+                const int dy = p.y - app->ui.dragStartY;
+                const RECT& o = app->ui.dragOrigRect;
+                const int minW = 320, minH = 240;
+                int nx = o.left, ny = o.top, nw = o.right - o.left, nh = o.bottom - o.top;
+                switch (app->ui.resizeEdge) {
+                    case 1: nx = o.left + dx; nw = o.right - nx; break;
+                    case 2: nw = (o.right - o.left) + dx; break;
+                    case 3: nh = (o.bottom - o.top) + dy; break;
+                    case 4: nx = o.left + dx; nw = o.right - nx; nh = (o.bottom - o.top) + dy; break;
+                    case 5: nw = (o.right - o.left) + dx; nh = (o.bottom - o.top) + dy; break;
+                }
+                if (nw < minW) { if (app->ui.resizeEdge == 1 || app->ui.resizeEdge == 4) nx = o.right - minW; nw = minW; }
+                if (nh < minH) { nh = minH; }
+                // 捕获期间 WM_SETCURSOR 不触发，主动设置缩放光标（32644=WE 32645=NS）
+                const int cid = (app->ui.resizeEdge == 1 || app->ui.resizeEdge == 2) ? 32644 : 32645;
+                SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(cid)));
+                platform::SetWindowPos(g_mainWindow, nullptr, nx, ny, nw, nh,
+                                       SWP_NOZORDER | SWP_FRAMECHANGED);
+                return 0;
+            }
             const float x = MouseX(lParam);
             const float y = MouseY(lParam);
  app->gizmo.mouseX = x; // 悬停高亮（中心环）用
@@ -802,8 +988,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                 (app->ui.resizeDrag == 1) ? &app->ui.panelLeftW :
                                 (app->ui.resizeDrag == 2) ? &app->ui.panelRightW : &app->ui.panelBottomH;
                 const uint32_t minVal = (app->ui.resizeDrag == 0) ? kTopBarHeight :
-                                        (app->ui.resizeDrag == 1 || app->ui.resizeDrag == 2) ? kSideBarWidth :
-                                                                                         kBottomBarHeight;
+                                        (app->ui.resizeDrag == 1) ? kLeftBarWidth :
+                                        (app->ui.resizeDrag == 2) ? kSideBarWidth : kBottomBarHeight;
                 const uint32_t W = app->vk.swapchainExtent.width;
                 const uint32_t H = app->vk.swapchainExtent.height;
  constexpr uint32_t kViewportMin = 60; // 视口最小保留
@@ -999,12 +1185,161 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             for (auto& b : app->ui.buttons) {
                 b.machine.OnMouseMove(PointInButton(b, x, y));
             }
+            app->ui.appIcon.machine.OnMouseMove(PointInButton(app->ui.appIcon, x, y));
+            for (int i = 0; i < 3; ++i)
+                app->ui.sysButtons[i].machine.OnMouseMove(PointInButton(app->ui.sysButtons[i], x, y));
             for (auto& b : app->ui.ballButtons) {
                 b.machine.OnMouseMove(PointInButton(b, x, y));
             }
             if (app->ui.menuOpen) {
                 for (int i = 0; i < 2; ++i) {
                     app->ui.menuItems[i].machine.OnMouseMove(PointInButton(app->ui.menuItems[i], x, y));
+                }
+            }
+        }
+        return 0;
+    case WM_NCHITTEST: {
+        if (App* app = GetApp(hwnd)) {
+            // 屏幕坐标 → 客户区坐标（ScreenToClient 与按钮 rect / swapchainExtent 同一坐标空间）。
+            // 原 GetWindowRect 近似在 DPI/多屏下错位 → 控件命中全失败、整条顶栏只会拖动。改用 ScreenToClient 修复。
+            POINT sp{ static_cast<LONG>(static_cast<short>(LOWORD(lParam))),
+                      static_cast<LONG>(static_cast<short>(HIWORD(lParam))) };
+            platform::ScreenToClient(g_mainWindow, &sp);
+            const float cx = static_cast<float>(sp.x);
+            const float cy = static_cast<float>(sp.y);
+            const int W = static_cast<int>(app->vk.swapchainExtent.width);
+            const int H = static_cast<int>(app->vk.swapchainExtent.height);
+            const int topH = static_cast<int>(app->ui.panelTopH);
+            constexpr float kCaptionDragH = 9.0f;   // 窗口移动检查高度：顶栏 36px 缩小 4 倍 → 9px
+
+            // 顶栏：命中控件 → 走客户区（按钮可点击）；空白最上 9px → 标题栏拖拽（HTCAPTION）
+            // 【诊断探针】hitCode：0=HTCAPTION 1=HTLEFT 2=HTRIGHT 3=HTBOTTOM 4=HTBOTTOMLEFT 5=HTBOTTOMRIGHT
+            int hitCode = -1;
+            if (cy >= 0.0f && cy < static_cast<float>(topH)) {
+                bool onCtrl = PointInButton(app->ui.appIcon, cx, cy);
+                for (auto& b : app->ui.buttons) if (PointInButton(b, cx, cy)) onCtrl = true;
+                for (int i = 0; i < 3 && !onCtrl; ++i)
+                    if (PointInButton(app->ui.sysButtons[i], cx, cy)) onCtrl = true;
+                if (!onCtrl && cy < kCaptionDragH) hitCode = 0;
+                // 命中控件 / 拖拽区之下的顶栏空白：落到下方 → HTCLIENT（按钮正常响应）
+            } else if (W > 0 && H > 0) {
+                // 无边框自由缩放（左/右/底边 6px + 底边两角）。
+                // 最大化状态也返回缩放代码：WM_NCLBUTTONDOWN 会先还原 normalRect 再缩放
+                // （否则启动默认最大化 → 边缘永远 HTCLIENT → "窗口无法缩放"）。
+                const int bz = 6;
+                const bool left   = cx <  bz;
+                const bool right  = cx >  W - bz;
+                const bool bottom = cy >  H - bz;
+                if (bottom && left)       hitCode = 4;
+                else if (bottom && right) hitCode = 5;
+                else if (left)            hitCode = 1;
+                else if (right)           hitCode = 2;
+                else if (bottom)          hitCode = 3;
+            }
+            if (hitCode >= 0) {
+                static int dbgHit = 0;
+                if (dbgHit++ < 20)
+                    VkbLog(("[dbg] NCHITTEST -> " + std::to_string(hitCode) + " cx=" + std::to_string((int)cx) +
+                            " cy=" + std::to_string((int)cy) + " max=" + (app->ui.maximized ? "1" : "0")).c_str());
+                static const LRESULT kCodes[] = { (LRESULT)HTCAPTION, (LRESULT)HTLEFT, (LRESULT)HTRIGHT,
+                                                  (LRESULT)HTBOTTOM,  (LRESULT)HTBOTTOMLEFT, (LRESULT)HTBOTTOMRIGHT };
+                return kCodes[hitCode];
+            }
+        }
+        // 其余区域统一返回 HTCLIENT（客户区，允许 orbit / 物体拾取）。
+        // 注：原代码此处 break 落到 DefWindowProc(WM_NCHITTEST)；本机（报 Windows 6.0 + 真实 NVIDIA 1.4 驱动）
+        // 下 DefWindowProc 处理部分窗口消息会永久阻塞主线程（同 49357 私有消息卡死），故不再交 DefWindowProc，
+        // 自绘无边框窗口客户区返回 HTCLIENT 与之等价，可规避该隐患。
+        return (LRESULT)HTCLIENT;
+    }
+    case WM_NCLBUTTONDOWN:
+        // 自定义标题栏拖拽 / 边缘缩放：不交给 DefWindowProc（本机 DefWindowProc 原生模态
+        // 拖拽/缩放循环会卡死/崩溃，与之前 WM_NCHITTEST 不交 DefWindowProc 同因）。
+        // 改为 SetCapture 后在 WM_MOUSEMOVE 里自行 SetWindowPos，释放时在 WM_LBUTTONUP 做边缘吸附。
+        if (App* app = GetApp(hwnd)) {
+            if (wParam == HTCAPTION) {
+                app->ui.captionDragging = true;
+                app->ui.edgeResizing   = false;
+                app->ui.dragStartX = static_cast<int>(LOWORD(lParam));
+                app->ui.dragStartY = static_cast<int>(HIWORD(lParam));
+                platform::GetWindowRect(g_mainWindow, &app->ui.dragOrigRect);
+                // 若当前已最大化：先还原到 normalRect，再以还原后位置为基准开始拖拽
+                // （避免从最大化态直接拖拽时窗口尺寸/位置错乱）
+                if (app->ui.maximized) {
+                    app->ui.maximized = false;
+                    platform::SetWindowPos(g_mainWindow, nullptr,
+                        app->ui.normalRect.left, app->ui.normalRect.top,
+                        app->ui.normalRect.right - app->ui.normalRect.left,
+                        app->ui.normalRect.bottom - app->ui.normalRect.top,
+                        SWP_NOZORDER | SWP_FRAMECHANGED);
+                    platform::GetWindowRect(g_mainWindow, &app->ui.dragOrigRect);
+                    app->ui.dragStartX = static_cast<int>(LOWORD(lParam));
+                    app->ui.dragStartY = static_cast<int>(HIWORD(lParam));
+                }
+                platform::SetCapture(g_mainWindow);
+                return 0;
+            }
+            int edge = 0;
+            if      (wParam == HTLEFT)        edge = 1;
+            else if (wParam == HTRIGHT)       edge = 2;
+            else if (wParam == HTBOTTOM)      edge = 3;
+            else if (wParam == HTBOTTOMLEFT)  edge = 4;
+            else if (wParam == HTBOTTOMRIGHT) edge = 5;
+            if (edge) {
+                static int dbgNclb = 0;
+                if (dbgNclb++ < 10)
+                    VkbLog(("[dbg] NCLB edge=" + std::to_string(edge) + " max=" + (app->ui.maximized ? "1" : "0")).c_str());
+                app->ui.edgeResizing     = true;
+                app->ui.resizeEdge       = edge;
+                app->ui.captionDragging = false;
+                app->ui.dragStartX = static_cast<int>(LOWORD(lParam));
+                app->ui.dragStartY = static_cast<int>(HIWORD(lParam));
+                platform::GetWindowRect(g_mainWindow, &app->ui.dragOrigRect);
+                // 若当前已最大化：先还原到 normalRect，再以还原后位置为基准缩放
+                // （最大化时窗口铺满工作区，不还原无法改变尺寸）
+                if (app->ui.maximized) {
+                    app->ui.maximized = false;
+                    platform::SetWindowPos(g_mainWindow, nullptr,
+                        app->ui.normalRect.left, app->ui.normalRect.top,
+                        app->ui.normalRect.right - app->ui.normalRect.left,
+                        app->ui.normalRect.bottom - app->ui.normalRect.top,
+                        SWP_NOZORDER | SWP_FRAMECHANGED);
+                    platform::GetWindowRect(g_mainWindow, &app->ui.dragOrigRect);
+                    app->ui.dragStartX = static_cast<int>(LOWORD(lParam));
+                    app->ui.dragStartY = static_cast<int>(HIWORD(lParam));
+                }
+                platform::SetCapture(g_mainWindow);
+                return 0;
+            }
+        }
+        break;  // 其他 NC 消息仍交 DefWindowProc
+    case WM_EXITSIZEMOVE:
+        // 标题栏拖拽结束（释放鼠标）→ Win10 及以下自实现边缘吸附；Win11+ 由系统原生 Snap 处理
+        if (App* app = GetApp(hwnd)) {
+            if (app->ui.captionDragging) {
+                app->ui.captionDragging = false;
+                if (!platform::IsWindows11OrLater()) {
+                    RECT wr{}; platform::GetWindowRect(g_mainWindow, &wr);
+                    RECT mw{}, wk{};
+                    platform::GetWindowMonitorRect(g_mainWindow, &mw, &wk);
+                    const int snap = 12;
+                    if (wr.top <= mw.top + snap) {
+                        platform::GetWindowRect(g_mainWindow, &app->ui.normalRect);  // 记住吸附前位置，供还原
+                        app->ui.maximized = true;
+                        // 用工作区显式定位（不用 SW_MAXIMIZE：对 WS_POPUP 窗口可能铺满整屏遮住任务栏）
+                        platform::SetWindowPos(g_mainWindow, nullptr, wk.left, wk.top,
+                                     wk.right - wk.left, wk.bottom - wk.top,
+                                     SWP_NOZORDER | SWP_FRAMECHANGED);
+                    } else if (wr.left <= mw.left + snap) {
+                        platform::SetWindowPos(g_mainWindow, nullptr, wk.left, wk.top,
+                                     (wk.right - wk.left) / 2, wk.bottom - wk.top,
+                                     SWP_NOZORDER | SWP_FRAMECHANGED);
+                    } else if (wr.right >= mw.right - snap) {
+                        const int hw = (wk.right - wk.left) / 2;
+                        platform::SetWindowPos(g_mainWindow, nullptr, wk.right - hw, wk.top,
+                                     hw, wk.bottom - wk.top,
+                                     SWP_NOZORDER | SWP_FRAMECHANGED);
+                    }
                 }
             }
         }
@@ -1042,38 +1377,61 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
     default:
+        // 修复：已注册窗口消息（0xC000+，如系统/第三方私有的 TaskbarButtonCreated 等）
+        // 本就不该交给 DefWindowProc 处理；本机（报 Windows 6.0 + 真实 NVIDIA 1.4 驱动）下
+        // DefWindowProc 对其会阻塞主线程导致假死。直接返回 0 忽略，任务栏图标由窗口样式+
+        // WM_SETICON 决定，与此消息无关。
+        if (msg >= 0xC000) return 0;
         return DefWindowProc(hwnd, msg, wParam, lParam);
     }
 }
 
+// 主窗口 platform:: 句柄（P1：窗口创建收口到 platform::，供退出时销毁）
+platform::Window* g_mainWindow = nullptr;
+
 bool CreateWindowApp(App& app, HINSTANCE hInstance) {
     const wchar_t kClassName[] = L"VulkanBlankWindow";
-    WNDCLASSEXW wc{};
-    wc.cbSize = sizeof(wc);
-    wc.style = CS_HREDRAW | CS_VREDRAW;
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = hInstance;
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(1));
-    wc.hIconSm = LoadIcon(hInstance, MAKEINTRESOURCE(1));
-    wc.lpszClassName = kClassName;
-    if (!RegisterClassExW(&wc)) {
-        SetError("窗口类注册失败");
-        return false;
-    }
+    // 还原尺寸/最大化状态为 app 布局逻辑，留在本函数
+    RECT mr{};
+    platform::GetPrimaryMonitorRect(nullptr, &mr);  // 工作区（避开任务栏，与窗口创建/最大化一致）
+    app.ui.maximized = true;  // 默认铺满工作区（非整屏，任务栏保持可见可点）
+    // 还原用窗口尺寸（居中、约 1200x780，避开任务栏留白）
+    const LONG nW = std::min<LONG>(1200, mr.right - mr.left - 80);
+    const LONG nH = std::min<LONG>(780, mr.bottom - mr.top - 80);
+    app.ui.normalRect = {
+        (mr.right - mr.left - nW) / 2 + mr.left,
+        (mr.bottom - mr.top - nH) / 2 + mr.top,
+        (mr.right - mr.left - nW) / 2 + mr.left + nW,
+        (mr.bottom - mr.top - nH) / 2 + mr.top + nH};
 
-    RECT rect{0, 0, static_cast<LONG>(kWindowWidth), static_cast<LONG>(kWindowHeight)};
-    AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
-    app.hwnd = CreateWindowExW(0, kClassName, kWindowTitle, WS_OVERLAPPEDWINDOW,
-                               CW_USEDEFAULT, CW_USEDEFAULT,
-                               rect.right - rect.left, rect.bottom - rect.top,
-                               nullptr, nullptr, hInstance, nullptr);
-    if (!app.hwnd) {
-        SetError("窗口创建失败");
-        return false;
-    }
-    SetWindowLongPtrW(app.hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&app));
+    // OS 边界收口：窗口创建委托 platform::（未来 macOS/Linux 仅替换后端）
+    g_mainWindow = platform::CreateMainWindow(hInstance, kClassName, kWindowTitle, WndProc, &app);
+    if (!g_mainWindow) return false;
+    app.hwnd = g_mainWindow->hwnd;  // 兼容既有 app.hwnd 用法（NCHITTEST/SetWindowPos/GetApp）
     return true;
+}
+
+// 全屏/还原切换：maximized=true 时铺满【工作区】，false 时恢复 normalRect 窗口。
+// 顶栏空白拖拽（WM_NCHITTEST 返回 HTCAPTION）依赖此状态判断。
+// 注意：必须用工作区 rcWork 而非整屏 rcMonitor——否则最大化会遮住任务栏，
+// 用户无法切换窗口/只能按 Win 键脱离（与 CreateMainWindow 的修复保持一致）。
+static void ToggleMaximize(App& app) {
+    RECT mr{};
+    platform::GetWindowMonitorRect(g_mainWindow, nullptr, &mr);  // 取工作区（避开任务栏）
+    if (app.ui.maximized) {
+        app.ui.maximized = false;
+        platform::SetWindowPos(g_mainWindow, nullptr,
+                     app.ui.normalRect.left, app.ui.normalRect.top,
+                     app.ui.normalRect.right - app.ui.normalRect.left,
+                     app.ui.normalRect.bottom - app.ui.normalRect.top,
+                     SWP_NOZORDER | SWP_FRAMECHANGED);
+    } else {
+        platform::GetWindowRect(g_mainWindow, &app.ui.normalRect);  // 记住当前窗口位置供下次还原
+        app.ui.maximized = true;
+        platform::SetWindowPos(g_mainWindow, nullptr, mr.left, mr.top,
+                     mr.right - mr.left, mr.bottom - mr.top,
+                     SWP_NOZORDER | SWP_FRAMECHANGED);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1206,39 +1564,13 @@ LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-// 鼠标灵敏度（0~100）→ orbit/pan 输入增益因子（0.1~2.0，50→1.05 接近中性）
-static float SensToFactor(int s) {
-    const float c = std::max(0, std::min(100, s)) / 100.0f;
-    return 0.1f + c * 1.9f;
-}
+// 鼠标灵敏度（0~100）↔ orbit/pan 输入增益因子 现定义于 awa_internal.h（SensToFactor / FactorToSens 内联）。
 
 
 
-// 设置窗口 -> 主循环 的单一同步点：每帧把设置窗口改动的 extern 全局回写到 App。
-// 把原本散落在主循环里的多段"轮询全局再回写"收敛到此处，集中表达跨窗口设置的耦合。
-static void SyncSettingsToApp(App& app) {
-    if (g_selectedAaMode != static_cast<int>(app.aa.aaMode)) {
-        ApplyAAMode(app, static_cast<AAMode>(g_selectedAaMode));
-    }
- // 摄像机阻尼实时应用：设置窗口滑动条改 g_cameraDamping，
- // 本同步点检测差异 -> 应用到 camera.damping（下一帧 UpdateSmooth 生效）+ 保存
-    {
-        const int dampNow = static_cast<int>(app.camera.damping * 100.0f + 0.5f);
-        if (g_cameraDamping != dampNow) {
-            app.camera.damping = g_cameraDamping / 100.0f;
-            SaveSettingInt("camera_damping", g_cameraDamping);
-        }
-    }
- // 鼠标滑动灵敏度实时应用：设置窗口滑动条改 g_mouseSensitivity，
- // 本同步点检测差异 -> 映射到 camera.orbitSensitivity（Orbit/Pan 输入增益）+ 保存
-    {
-        const float sensFactor = SensToFactor(g_mouseSensitivity);
-        if (std::fabs(sensFactor - app.camera.orbitSensitivity) > 1e-3f) {
-            app.camera.orbitSensitivity = sensFactor;
-            SaveSettingInt("mouse_sensitivity", g_mouseSensitivity);
-        }
-    }
-}
+// 设置窗口现改为事件驱动：滑动条/选项变更时由 OpenSettingsWindow 持有的 App& 直接写回并保存，
+// 不再经外部全局 + 主循环每帧轮询（SensToFactor 已移至 awa_internal.h 内联）。
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
  // DPI 感知——Windows 缩放下 swapchain 用物理像素，2D 不再被系统放大模糊
     {
@@ -1340,32 +1672,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     case AAMode::SSAA:    app.aa.msaaEnabled = true; app.aa.msaaSamples = VK_SAMPLE_COUNT_4_BIT; break;
     default: break;
     }
-    g_selectedAaMode = static_cast<int>(app.aa.aaMode);
-
  // 摄像机阻尼设置项：从 awa_settings.txt 加载（0~100，默认 85）
     const int savedDamp = LoadSettingInt("camera_damping", -1);
     if (savedDamp >= 0 && savedDamp <= 100) {
         app.camera.damping = savedDamp / 100.0f;
-        g_cameraDamping = savedDamp;
-    } else {
-        g_cameraDamping = static_cast<int>(app.camera.damping * 100.0f + 0.5f);
     }
 
  // 鼠标滑动灵敏度设置项：从 awa_settings.txt 加载（0~100，默认 50）
     const int savedSens = LoadSettingInt("mouse_sensitivity", -1);
     if (savedSens >= 0 && savedSens <= 100) {
-        g_mouseSensitivity = savedSens;
         app.camera.orbitSensitivity = SensToFactor(savedSens);
     } else {
-        g_mouseSensitivity = 50;
         app.camera.orbitSensitivity = SensToFactor(50);
     }
 
  // 面板尺寸持久化——顶栏固定默认高度（不读 panel_top_h，取消顶栏缩放）；左/右/底可拖
     app.ui.panelTopH = kTopBarHeight;
     {
-        const int l = LoadSettingInt("panel_left_w", -1);
-        if (l >= static_cast<int>(kSideBarWidth))    app.ui.panelLeftW = static_cast<uint32_t>(l);
+        // 左栏固定 kLeftBarWidth（不可缩放），不读 panel_left_w 设置
         const int rr = LoadSettingInt("panel_right_w", -1);
         if (rr >= static_cast<int>(kSideBarWidth))   app.ui.panelRightW = static_cast<uint32_t>(rr);
         const int b = LoadSettingInt("panel_bottom_h", -1);
@@ -1425,6 +1749,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     };
     initStep(CreateVertexBuffer(app), "CreateVertexBuffer");
     initStep(CreatePipeline(app), "CreatePipeline");
+ // 关键：UI 面板管线（pipelineUI）默认 1 采样，必须启动时创建。
+ // 之前只在 ApplyAAMode 内创建，导致启动首帧 UI pass 绑定空管线 → UI 不显示/崩溃。
+    initStep(CreatePipelineUI(app), "CreatePipelineUI");
     initStep(CreateMenuPipeline(app), "CreateMenuPipeline");
     initStep(CreatePipelineGrid(app), "CreatePipelineGrid");
     initStep(CreatePipelineSolid(app), "CreatePipelineSolid");
@@ -1491,6 +1818,60 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     }
 
     {
+        g_stage = "文件图标(kFilePng)";
+        // 内嵌资源：用户自制文件夹图标（assets/5.png 原始 94x66），与其他图标一致靠 .inc 嵌入
+        std::vector<uint8_t> iconRgba;
+        int iw = 0, ih = 0;
+        if (!DecodePngWic(kFilePng, kFilePngSize, iconRgba, iw, ih) || iw <= 0 || ih <= 0) {
+            VkbLog(("[icon] 文件图标纹理创建失败（降级：无图标）: " + g_error).c_str());
+            g_error.clear();
+        } else {
+            // 等比居中入 square 画布（letterbox），避免非方形图标被拉变形
+            const int side = std::max(iw, ih);
+            std::vector<uint8_t> sq(static_cast<size_t>(side) * side * 4, 0);
+            const int ox = (side - iw) / 2, oy = (side - ih) / 2;
+            for (int y = 0; y < ih; ++y)
+                for (int x = 0; x < iw; ++x) {
+                    const int si = (y * iw + x) * 4;
+                    const int di = (((oy + y) * side) + (ox + x)) * 4;
+                    sq[di] = iconRgba[si]; sq[di + 1] = iconRgba[si + 1];
+                    sq[di + 2] = iconRgba[si + 2]; sq[di + 3] = iconRgba[si + 3];
+                }
+            if (!CreateIconTexture(app, sq, side, side,
+                                   app.vk.fileImage, app.vk.fileMemory, app.vk.fileView, app.vk.fileDescriptorSet)) {
+                VkbLog(("[icon] 文件图标纹理创建失败（降级：无图标）: " + g_error).c_str());
+                g_error.clear();
+            }
+        }
+    }
+
+    {
+        g_stage = "图标:awa logo(CreateIconTexture)";
+        std::vector<uint8_t> iconRgba;
+        int iw = 0, ih = 0;
+        if (!DecodePngWic(kAwaPng, kAwaPngSize, iconRgba, iw, ih) ||
+            !CreateIconTexture(app, iconRgba, iw, ih,
+                               app.vk.appIconImage, app.vk.appIconMemory,
+                               app.vk.appIconView, app.vk.appIconDescriptorSet)) {
+            VkbLog(("[icon] awa 图标纹理创建失败（降级：回退齿轮）: " + g_error).c_str());
+            g_error.clear();
+            // 真回退：awa 加载失败则单独用齿轮 PNG 建一个图标描述符集，
+            // 避免 appIconDescriptorSet 为空导致 DrawIcon 啥也不画（图标不可见）。
+            if (app.vk.appIconImage  != VK_NULL_HANDLE) { vkDestroyImage(app.vk.device, app.vk.appIconImage,  nullptr); app.vk.appIconImage  = VK_NULL_HANDLE; }
+            if (app.vk.appIconMemory != VK_NULL_HANDLE) { vkFreeMemory(app.vk.device, app.vk.appIconMemory, nullptr); app.vk.appIconMemory = VK_NULL_HANDLE; }
+            if (app.vk.appIconView   != VK_NULL_HANDLE) { vkDestroyImageView(app.vk.device, app.vk.appIconView, nullptr); app.vk.appIconView = VK_NULL_HANDLE; }
+            app.vk.appIconDescriptorSet = VK_NULL_HANDLE;  // 描述符集来自池，不销毁，仅置空待重建
+            std::vector<uint8_t> gr{}; int gw = 0, gh = 0;
+            if (DecodePngWic(kGearPng, kGearPngSize, gr, gw, gh) &&
+                CreateIconTexture(app, gr, gw, gh,
+                                 app.vk.appIconImage, app.vk.appIconMemory,
+                                 app.vk.appIconView, app.vk.appIconDescriptorSet)) {
+                VkbLog("[icon] awa 图标回退齿轮成功");
+            }
+        }
+    }
+
+    {
         g_stage = "球按钮图标(LoadBallIcons)";
         LoadBallIcons(app);
     }
@@ -1525,8 +1906,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             wsprintfW(g_renderBottomText,
                       L"awa %s · 著作人：%s · vulkan %d.%d - %s渲染 · %s",
                       kVersionW, kAuthorW, gpuMaj, gpuMin, typeW, vendorW);
-            OpenSettingsWindow(a.hwnd, static_cast<int>(a.aa.aaMode));
+            OpenSettingsWindow(a.hwnd, a);
         };
+        for (int i = 0; i < 4; ++i) {
+            b.color[i] = app.ui.buttonTheme.normal[i];
+            b.border[i] = kBorderColor.float32[i];
+        }
+        app.ui.buttons.push_back(b);
+    }
+    {
+        UiButton b;
+        b.rect = {{12, 4}, {50, 28}};  // 占位 rect，实际位置由 ComputeTopBar 每帧覆盖
+        b.radius = 4.0f;
+        b.icon = 2;                   // 文件图标（fileDescriptorSet）
+        b.onClick = nullptr;          // 占位：点击行为待定
         for (int i = 0; i < 4; ++i) {
             b.color[i] = app.ui.buttonTheme.normal[i];
             b.border[i] = kBorderColor.float32[i];
@@ -1559,16 +1952,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
              editBtn.rect.offset.y + static_cast<int32_t>(editBtn.rect.extent.height) + 2},
             {200, 0}
         };
- // 编辑按钮右侧竖直分割线 x 坐标（右边缘 + 150，左移 80px → +70）
-        app.ui.editDividerX = editBtn.rect.offset.x + static_cast<int32_t>(editBtn.rect.extent.width) + 70;
     }
 
  // 第二条分割线右侧新建 3 个相连按钮（各宽 50px、无间隔）
  // 绑定变换模式——按钮1=移动 按钮2=旋转 按钮3=缩放（gizmoMode 0/1/2）
-    if (app.ui.editDividerX > 0) {
+ // 注：rect 由 ComputeTopBar 每帧覆盖（顺位布局），此处仅给初始占位值。
+    {
         for (int i = 0; i < 3; ++i) {
             UiButton b;
-            b.rect = {{app.ui.editDividerX + 12 + i * 50, 4}, {50, 28}};
+            b.rect = {{12 + i * 50, 4}, {50, 28}};
             b.radius = 4.0f;
             b.icon = 0;
  b.onClick = nullptr; // 变换模式在 WM_LBUTTONUP 按按钮索引设置（onClick 是函数指针不能捕获）
@@ -1577,6 +1969,46 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 b.border[c] = kBorderColor.float32[c];
             }
             app.ui.buttons.push_back(b);
+        }
+    }
+
+    // ---- 顶栏宽按钮文字（设置/文件/编辑）：默认中文，button_labels.txt（exe 同目录）可外部覆盖 ----
+    if (app.ui.buttons.size() >= 3) {
+        static const wchar_t* kDefLabels[3] = {L"设置", L"文件", L"编辑"};
+        for (int i = 0; i < 3; ++i) app.ui.buttons[i].label = kDefLabels[i];
+        LoadButtonLabels(app.ui.buttons.data(), static_cast<int>(app.ui.buttons.size()));
+    }
+    // 开源按钮字体：私有加载 资源/NotoSansSC-Regular.otf（OFL 协议；失败回退系统微软雅黑）
+    {
+        wchar_t exePath[MAX_PATH];
+        if (GetModuleFileNameW(nullptr, exePath, MAX_PATH)) {
+            wchar_t* slash = wcsrchr(exePath, L'\\');
+            if (slash) {
+                *(slash + 1) = L'\0';
+                wcscat(exePath, L"资源\\NotoSansSC-Regular.otf");
+                if (AddFontResourceExW(exePath, FR_PRIVATE, 0) > 0)
+                    wcscpy(g_buttonFontName, L"Noto Sans SC");
+            }
+        }
+    }
+    // 按钮文字纹理：RasterizeText 光栅化 → 延迟上传（帧首 FlushPendingLabelUploads 真正上传）
+    {
+        g_stage = "按钮文字纹理";
+        for (int i = 0; i < 3; ++i) {
+            if (app.ui.buttons[i].label.empty()) continue;
+            std::vector<uint8_t> rgba;
+            int tw = 0, th = 0;
+            if (RasterizeText(app.ui.buttons[i].label.c_str(), 14, 2, g_buttonFontName, rgba, tw, th)) {
+                UploadLabelRgba(app, app.ui.buttonLabels[i], rgba, tw, th);
+            }
+        }
+        // 右部物体栏标题条文字「物体列表」（卡片列表控件方案B）
+        {
+            std::vector<uint8_t> rgba;
+            int tw = 0, th = 0;
+            if (RasterizeText(L"物体列表", 12, 2, g_buttonFontName, rgba, tw, th)) {
+                UploadLabelRgba(app, app.ui.objPanelTitle, rgba, tw, th);
+            }
         }
     }
 
@@ -1606,24 +2038,82 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         };
     }
 
-    ShowWindow(app.hwnd, SW_MAXIMIZE);
-    g_stage = "主循环";
+    // 左上角软件图标（纯展示品牌图标，非按钮：无边框、不响应点击、无悬停高亮）
+    {
+        UiButton& a = app.ui.appIcon;
+        a.rect = {{8, 4}, {28, 28}};  // 占位，ComputeTopBar 每帧覆盖
+        a.radius = 4.0f;
+        a.icon = 0;  // 齿轮
+        a.onClick = nullptr;  // 纯展示品牌图标：不响应点击（打开设置由「设置」按钮负责）
+        for (int i = 0; i < 4; ++i) {
+            a.color[i] = app.ui.buttonTheme.normal[i];
+            a.border[i] = kBorderColor.float32[i];
+        }
+    }
+    // 右上角系统按钮：最小化/最大化/关闭（PS 风格，占位 rect 由 ComputeTopBar 覆盖）
+    for (int i = 0; i < 3; ++i) {
+        UiButton& s = app.ui.sysButtons[i];
+        s.rect = {{0, 0}, {40, 36}};
+        s.radius = 0.0f;
+        s.icon = 0;
+        for (int j = 0; j < 4; ++j) {
+            s.color[j] = app.ui.buttonTheme.normal[j];
+            s.border[j] = kBorderColor.float32[j];
+        }
+    }
+
+    platform::ShowWindow(g_mainWindow, SW_SHOW);
+    VkbLog("[loop] 进入主循环");
 
     MSG msg{};
     while (app.running) {
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        { static int s_pp=0; if(s_pp<6){++s_pp; VkbLog("[post-pump]");} }
             if (msg.message == WM_QUIT) app.running = false;
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
 
         if (app.running) {
- // 设置窗口 -> 主循环 的单一同步点（集中表达跨窗口设置的耦合，替代散落的逐段轮询）
-            SyncSettingsToApp(app);
+            // 窗口外 4px 热区：拖拽检测区 = 上边缘居中向外（窗口外上方 4px 也触发手势/拖拽）。
+            // 鼠标在窗口外时消息到不了窗口，需主循环主动轮询光标：悬停显示手势；按住左键接管拖拽。
+            // 注意：仅处理【窗口外】部分；窗口内 0~9px 由 WM_SETCURSOR/NCHITTEST 处理（避免抢按钮光标）。
+            {
+                POINT hp{}; GetCursorPos(&hp);
+                RECT hwr{}; platform::GetWindowRect(g_mainWindow, &hwr);
+                const bool inHot = (hp.y >= hwr.top - 4 && hp.y < hwr.top &&
+                                    hp.x >= hwr.left && hp.x <= hwr.right);
+                if (inHot) {
+                    SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32649)));  // IDC_HAND 手势
+                    if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) &&
+                        !app.ui.captionDragging && !app.ui.edgeResizing) {
+                        app.ui.captionDragging = true;
+                        app.ui.edgeResizing   = false;
+                        app.ui.dragStartX = hp.x;
+                        app.ui.dragStartY = hp.y;
+                        platform::GetWindowRect(g_mainWindow, &app.ui.dragOrigRect);
+                        // 最大化时先还原 normalRect 再拖
+                        if (app.ui.maximized) {
+                            app.ui.maximized = false;
+                            platform::SetWindowPos(g_mainWindow, nullptr,
+                                app.ui.normalRect.left, app.ui.normalRect.top,
+                                app.ui.normalRect.right - app.ui.normalRect.left,
+                                app.ui.normalRect.bottom - app.ui.normalRect.top,
+                                SWP_NOZORDER | SWP_FRAMECHANGED);
+                            platform::GetWindowRect(g_mainWindow, &app.ui.dragOrigRect);
+                        }
+                        platform::SetCapture(g_mainWindow);
+                        VkbLog("[dbg] HOTZONE drag start");
+                    }
+                }
+            }
+            { static int s_run=0; if(s_run<6){++s_run; VkbLog("[run]");} }
             app.camera.UpdateSmooth();
             for (auto& b : app.ui.buttons) UpdateButtonColor(b, app.ui.buttonTheme);
             for (auto& b : app.ui.ballButtons) UpdateButtonColor(b, app.ui.buttonTheme);
             for (auto& b : app.ui.menuItems) UpdateButtonColor(b, app.ui.buttonTheme);
+            UpdateButtonColor(app.ui.appIcon, app.ui.buttonTheme);
+            for (int i = 0; i < 3; ++i) UpdateButtonColor(app.ui.sysButtons[i], app.ui.buttonTheme);
             {
                 const float t = static_cast<float>(GetTickCount64() - app.ui.menuAnimStartMs) / 1000.0f;
                 if (app.ui.menuOpen) {
@@ -1669,7 +2159,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             }
  // 物体显示栏标签右侧面板展示当前物体名称/位置
             UpdateObjectLabels(app);
-            DrawFrame(app);
+            { static int s_ol=0; if(s_ol<6){++s_ol; VkbLog("[upd-objlbl]");} }
+            { static int s_pred=0; if(s_pred<4){++s_pred; VkbLog("[pre-draw]");} }
+            // 最小化期间停止渲染：最小化窗口交换链不可用，继续操作会触发驱动崩溃
+            if (!app.ui.minimized) {
+                DrawFrame(app);
+            { static int s_postd=0; if(s_postd<4){++s_postd; VkbLog("[post-draw]");} }
+            }
         }
     }
 
@@ -1677,5 +2173,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     WaitForImportThread();
     vkDeviceWaitIdle(app.vk.device);
     Cleanup(app);
+    platform::DestroyMainWindow(g_mainWindow);  // 释放主窗口（OS 边界收口）
+    g_mainWindow = nullptr;
     return 0;
 }

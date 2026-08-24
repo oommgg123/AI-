@@ -24,7 +24,7 @@
 #include <vector>
 
 #include "app.h"
-#include "gdi_util.h"   // 共享 GDI 工具：RegisterWindowClass / DoubleBuffer（消除逐字复制的脚手架）
+#include "ui2d.h"   // 共享 GDI 工具：RegisterWindowClass / DoubleBuffer（消除逐字复制的脚手架）
 #include "ui_presets.h" // 统一控件预设体系：MC 窗口 GDI 颜色/进度条尺寸从 ui::g_theme 取值
 
 // ---- main.cpp 提供的外部符号（保持单一定义）----
@@ -614,6 +614,56 @@ DWORD WINAPI ImportWorker(LPVOID param) {
     return 0;
 }
 
+// Round395：带超时的"设备空闲"等待，替代 vkDeviceWaitIdle。
+// vkDeviceWaitIdle 无超时参数，设备异常（TDR/驱动挂死）时会永久阻塞主线程 → 软件硬冻结、只能任务管理器杀。
+// 改用一次性栅栏 + vkWaitForFences(timeout) 兜底：超时即判定设备无响应，调用方可安全跳过。
+static bool BoundedDeviceIdle(App& app, uint64_t timeoutNs) {
+    VkFence fence = VK_NULL_HANDLE;
+    VkFenceCreateInfo fci{};
+    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    if (vkCreateFence(app.vk.device, &fci, nullptr, &fence) != VK_SUCCESS) return false;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandPoolCreateInfo pci{};
+    pci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    pci.queueFamilyIndex = app.vk.graphicsFamily;
+    if (vkCreateCommandPool(app.vk.device, &pci, nullptr, &pool) != VK_SUCCESS) {
+        vkDestroyFence(app.vk.device, fence, nullptr);
+        return false;
+    }
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    ai.commandPool = pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
+    if (vkAllocateCommandBuffers(app.vk.device, &ai, &cmd) != VK_SUCCESS) {
+        vkDestroyCommandPool(app.vk.device, pool, nullptr);
+        vkDestroyFence(app.vk.device, fence, nullptr);
+        return false;
+    }
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS ||
+        vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+        vkDestroyCommandPool(app.vk.device, pool, nullptr);
+        vkDestroyFence(app.vk.device, fence, nullptr);
+        return false;
+    }
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
+    VkResult sr = vkQueueSubmit(app.vk.graphicsQueue, 1, &si, fence);
+    bool ok = (sr == VK_SUCCESS || sr == VK_SUBOPTIMAL_KHR);
+    if (ok) {
+        const VkResult wr = vkWaitForFences(app.vk.device, 1, &fence, VK_TRUE, timeoutNs);
+        ok = (wr == VK_SUCCESS || wr == VK_SUBOPTIMAL_KHR);
+        if (wr == VK_TIMEOUT) VkbLog("[import] BoundedDeviceIdle 等待超时（设备无响应）");
+    }
+    vkDestroyCommandPool(app.vk.device, pool, nullptr);  // 同时释放 cmd
+    vkDestroyFence(app.vk.device, fence, nullptr);
+    return ok;
+}
+
 void ApplyImportResult(App& app) {
     g_stage = "ApplyImportResult:开始";
     const bool startupImport = g_isStartupImport;   // 启动导入失败静默降级（不弹窗打断启动）
@@ -627,21 +677,16 @@ void ApplyImportResult(App& app) {
         return;
     }
     g_stage = "ApplyImportResult:vkDeviceWaitIdle";
-    // Round375+：驱动 TDR 偶发 DEVICE_LOST，下一帧 RecreateSwapchain 自动恢复——短重试而非立即弹窗
-    {
-        VkResult devRes = VK_SUCCESS;
-        for (int attempt = 0; attempt < 10; ++attempt) {
-            devRes = vkDeviceWaitIdle(app.vk.device);
-            if (devRes != VK_ERROR_DEVICE_LOST) break;
-            Sleep(50);
-        }
-        if (devRes == VK_ERROR_DEVICE_LOST) {
-            g_isStartupImport = false;
-            if (startupImport) return;
-            MessageBoxW(app.hwnd, L"显卡设备丢失，导入已取消。请重启软件或更新显卡驱动后重试。",
-                        L"awa - 导入失败", MB_ICONWARNING | MB_OK);
+    // Round395：用带超时栅栏等待替代无超时的 vkDeviceWaitIdle（避免设备异常时主线程永久冻结）
+    if (!BoundedDeviceIdle(app, 3000000000ull /*3s*/)) {
+        g_isStartupImport = false;
+        if (startupImport) {
+            VkbLog("[import] 启动导入：设备空闲等待超时，静默跳过（软件继续运行）");
             return;
         }
+        MessageBoxW(app.hwnd, L"显卡设备无响应，导入已取消。请重启软件或更新显卡驱动后重试。",
+                    L"awa - 导入失败", MB_ICONWARNING | MB_OK);
+        return;
     }
     HCURSOR prevCursor = SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32650)));
     // Round249：追加而非清空——新导入物体不会删除已有物体（多物体场景）
@@ -672,6 +717,13 @@ void ApplyImportResult(App& app) {
     g_importUploading = 0;
     g_importProgress = -1;
     if (!vbOk) {
+        // Round395：上传失败（设备无响应等）→ 移除刚追加的、缺少有效 GPU 缓冲的物体，
+        // 避免 DrawFrame 绘制无缓冲对象再次异常；软件继续运行而非冻结。
+        if (!app.scene.objects.empty()) {
+            app.scene.objects.pop_back();
+            if (app.scene.selectedObject >= static_cast<int>(app.scene.objects.size()))
+                app.scene.selectedObject = -1;
+        }
         ShowErrorBox(g_error.c_str());
         g_error.clear();
     }
@@ -903,8 +955,8 @@ LRESULT CALLBACK McWorldImporter::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
             const int cw = full.right - full.left, ch = full.bottom - full.top;
             // 双缓冲：惰性缓存 DC（尺寸变化时重建）
             if (!self->m_db.dc || self->m_db.w != cw || self->m_db.h != ch) {
-                gdi::FreeDoubleBuffer(self->m_db);
-                self->m_db = gdi::CreateDoubleBuffer(hdc, cw, ch);
+                ui2d::FreeDoubleBuffer(self->m_db);
+                self->m_db = ui2d::CreateDoubleBuffer(hdc, cw, ch);
             }
             HDC mem = self->m_db.dc;
             HBRUSH bg = CreateSolidBrush(kMcBg); FillRect(mem, &full, bg); DeleteObject(bg);
@@ -982,7 +1034,7 @@ LRESULT CALLBACK McWorldImporter::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
         case WM_DESTROY:
             // 激活恢复已由 WM_CLOSE / CloseWindow 完成（先 Enable 后 Destroy 的正确顺序），
             // 这里只做资源清理
-            gdi::FreeDoubleBuffer(self->m_db);  // 释放缓存的双缓冲 DC
+            ui2d::FreeDoubleBuffer(self->m_db);  // 释放缓存的双缓冲 DC
             if (!self->m_tempDir.empty()) {     // 清理 .mcworld 解压临时目录
                 RemoveDirRecursive(self->m_tempDir);
                 self->m_tempDir.clear();
@@ -1061,7 +1113,7 @@ HWND McWorldImporter::OpenWindow(HWND owner, const wchar_t* versionText) {
     HICON hAppIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1));  // 复用主程序图标
     if (!m_registered) {
         // 复用共享 GDI 窗口类注册（消除逐字复制的 WNDCLASSEXW 脚手架）
-        gdi::RegisterWindowClass(L"awaMcWorldWindow", WndProc, kMcBg, hAppIcon, hAppIcon);
+        ui2d::RegisterWindowClass(L"awaMcWorldWindow", WndProc, kMcBg, hAppIcon, hAppIcon);
         m_registered = true;
     }
     // 不可缩放：去掉 THICKFRAME(拉伸边框)/最小化/最大化；仅保留标题栏+关闭按钮
