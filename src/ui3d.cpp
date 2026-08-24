@@ -279,10 +279,10 @@ void ComputeTopBar(App& app, const Layout& layout) {
         }
     }
 
-    // ---- 右侧：系统按钮 最小化/最大化/关闭（24×24，右侧留 2px 边距 + 4px 间距，垂直居中）----
+    // ---- 右侧：系统按钮 最小化/最大化/关闭（24×24，贴右上角：右缘 0 边距 + 上移 6→2，间距 4）----
     const int sysW = 24, sysH = 24;   // 小号 PS 风格按钮
-    const int sysTop = (topH - sysH) / 2;  // 垂直居中：(36-24)/2=6
-    const int sysMargin = 2;   // 最右按钮距窗口右缘留白
+    const int sysTop = 2;             // 贴顶（原垂直居中 6 → 2，更靠右上角）
+    const int sysMargin = 0;          // 最右按钮贴窗口右缘（原 2 → 0）
     const int sysGap = 4;      // 相邻按钮间距（修复："过宽不居中"=按钮贴在一起像一整块）
     app.ui.sysButtons[2].rect = {{(int32_t)(w - sysMargin - sysW),                  sysTop}, {(uint32_t)sysW, (uint32_t)sysH}}; // 关闭(最右)
     app.ui.sysButtons[1].rect = {{(int32_t)(w - sysMargin - 2 * sysW - sysGap),     sysTop}, {(uint32_t)sysW, (uint32_t)sysH}}; // 最大化
@@ -341,9 +341,12 @@ void OpenRenameEdit(App& app, int index) {
     app.ui.renameIndex = index;
     if (index < 0 || index >= static_cast<int>(app.scene.objects.size())) { app.ui.renameIndex = -1; return; }
     const SceneObject& o = app.scene.objects[static_cast<size_t>(index)];
-    const int ew = 320, eh = 26;
-    const int ex = (static_cast<int>(app.vk.swapchainExtent.width) - ew) / 2;
-    const int ey = static_cast<int>(app.ui.panelTopH) + 10;
+    // 编辑框显示在右部物体栏目标行上（跟随卡片布局：标题条偏移 + 行间距）
+    const Layout layR = ComputeLayout(app);
+    const int ex = layR.right.offset.x + kObjPanelPad;
+    const int ey = layR.right.offset.y + kObjPanelPad + kObjTitleH + index * (kObjPanelRowH + kObjRowGap);
+    const int ew = static_cast<int>(layR.right.extent.width) - 2 * kObjPanelPad;
+    const int eh = kObjPanelRowH;
     app.ui.renameEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", o.name.c_str(),
                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
                                      ex, ey, ew, eh, app.hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
@@ -951,7 +954,7 @@ void FlushPendingLabelUploads(App& app) {
  // 帧首安全点：DrawFrame 已在第 508 行等待上一帧栅栏成功（上一帧已结束），
  // 当前帧尚未录制命令缓冲，此时销毁旧标签纹理、重建新纹理安全，不会破坏任何进行中的命令缓冲。
     App::LabelTexture* labels[] = {
-        &app.ui.objNameLabel, &app.ui.objPanelTitle, &app.ui.scaleLabel, &app.ui.importUpLabel,
+        &app.ui.objNameLabel, &app.ui.objPanelTitle, &app.ui.objNameHighlight, &app.ui.scaleLabel, &app.ui.importUpLabel,
         &app.ui.coordLabels[0], &app.ui.coordLabels[1], &app.ui.coordLabels[2],
         &app.ui.buttonLabels[0], &app.ui.buttonLabels[1], &app.ui.buttonLabels[2],
     };
@@ -981,7 +984,7 @@ bool RasterizeNameList(const std::vector<std::wstring>& names, int width, int ro
     if (!bmp) { DeleteDC(hdc); return false; }
     HGDIOBJ oldBmp = SelectObject(hdc, bmp);
     std::memset(bits, 0, static_cast<size_t>(width) * h * 4);
-    HFONT font = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+    HFONT font = CreateFontW(-14, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                              CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"微软雅黑");
     HGDIOBJ oldFont = SelectObject(hdc, font);
@@ -1008,13 +1011,22 @@ bool RasterizeNameList(const std::vector<std::wstring>& names, int width, int ro
     return true;
 }
 void UpdateObjectLabels(App& app) {
+    // 可见行 = 从 objScroll 起最多 kObjMaxRows 行（超出 5 栏滚动时仅重建可见行纹理）
+    const int nAll = static_cast<int>(app.scene.objects.size());
+    const int maxScroll = (nAll > kObjMaxRows) ? (nAll - kObjMaxRows) : 0;
+    if (app.ui.objScroll > maxScroll) app.ui.objScroll = maxScroll;
+    if (app.ui.objScroll < 0) app.ui.objScroll = 0;
+    const int from = app.ui.objScroll;
+    const int to = std::min(from + kObjMaxRows, nAll);
+
     std::vector<std::wstring> names;
     std::wstring key;
-    for (const auto& o : app.scene.objects) {
-        names.push_back(o.name);
-        key += std::to_wstring(o.name.size()) + L":" + o.name + L"\n";
+    for (int i = from; i < to; ++i) {
+        names.push_back(app.scene.objects[static_cast<size_t>(i)].name);
+        key += std::to_wstring(i) + L":" + app.scene.objects[static_cast<size_t>(i)].name + L"\n";
     }
     key += L"sel=" + std::to_wstring(app.scene.selectedObject);
+    key += L"sc=" + std::to_wstring(app.ui.objScroll);
  if (key == app.ui.objNameLabel.text) return; // 未变化
     const uint64_t nowMs = GetTickCount64();
  if (nowMs - app.ui.objLabelThrottleMs < 100) return; // 节流
@@ -1036,6 +1048,60 @@ void UpdateObjectLabels(App& app) {
     if (!RasterizeNameList(names, kListW, kObjPanelRowH, rgba, w, h)) return;
     UploadLabelRgba(app, app.ui.objNameLabel, rgba, w, h);
     app.ui.objNameLabel.text = key;
+
+    // 选中行加粗高亮文字（Blender Outliner 选中感：蓝条 + 加粗白字覆盖）
+    {
+        const int selGlobal = app.scene.selectedObject;
+        const int selKey = (selGlobal >= from && selGlobal < to) ? (selGlobal - from) : -1;  // 可见区内索引
+        std::wstring hkey = L"h:" + std::to_wstring(selGlobal) + L":" + std::to_wstring(app.ui.objScroll);
+        if (selKey < 0 || selGlobal < 0 || selGlobal >= nAll) {
+            // 选中行不可见：清空高亮纹理
+            if (app.ui.objNameHighlight.text != hkey) {
+                app.ui.objNameHighlight.w = 0; app.ui.objNameHighlight.h = 0; app.ui.objNameHighlight.text = hkey;
+            }
+        } else if (app.ui.objNameHighlight.text != hkey) {
+            const std::wstring& selName = app.scene.objects[static_cast<size_t>(selGlobal)].name;
+            // GDI 直接光栅化单行（FW_BOLD + 16px，与物体栏主题一致；纹理仅含选中行名字）
+            HDC hdc = CreateCompatibleDC(nullptr);
+            if (hdc) {
+                HFONT hf = CreateFontW(-16, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                       CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"微软雅黑");
+                if (hf) {
+                    HGDIOBJ oldF = SelectObject(hdc, hf);
+                    SIZE sz{}; GetTextExtentPoint32W(hdc, selName.c_str(), (int)selName.size(), &sz);
+                    const int tw = sz.cx + 6, th = 22;
+                    BITMAPINFO bmi{}; bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                    bmi.bmiHeader.biWidth = tw; bmi.bmiHeader.biHeight = -th;
+                    bmi.bmiHeader.biPlanes = 1; bmi.bmiHeader.biBitCount = 32; bmi.bmiHeader.biCompression = BI_RGB;
+                    void* bits = nullptr;
+                    HBITMAP bmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+                    if (bmp) {
+                        HGDIOBJ oldB = SelectObject(hdc, bmp);
+                        std::memset(bits, 0, (size_t)tw * th * 4);
+                        SetTextColor(hdc, RGB(255, 255, 255));
+                        SetBkMode(hdc, TRANSPARENT);
+                        RECT rc{3, 0, tw, th};
+                        DrawTextW(hdc, selName.c_str(), -1, &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                        std::vector<uint8_t> hrgba((size_t)tw * th * 4);
+                        const uint8_t* p = (const uint8_t*)bits;
+                        for (int i = 0; i < tw * th; ++i) {
+                            const uint8_t b = p[i*4+0], g = p[i*4+1], r = p[i*4+2];
+                            const uint8_t m1 = (r > g) ? r : g;
+                            const uint8_t a = (m1 > b) ? m1 : b;
+                            hrgba[i*4+0] = 255; hrgba[i*4+1] = 255; hrgba[i*4+2] = 255; hrgba[i*4+3] = a;
+                        }
+                        SelectObject(hdc, oldB); DeleteObject(bmp);
+                        UploadLabelRgba(app, app.ui.objNameHighlight, hrgba, tw, th);
+                        app.ui.objNameHighlight.text = hkey;
+                        app.ui.objNameHighlight.w = tw; app.ui.objNameHighlight.h = th;
+                    }
+                    SelectObject(hdc, oldF); DeleteObject(hf);
+                }
+                DeleteDC(hdc);
+            }
+        }
+    }
 }
 void UpdateNavHud(App& app) {
     static uint64_t s_lastFrameMs = 0;
@@ -1075,7 +1141,64 @@ void UpdateNavHud(App& app) {
         }
     }
 }
-void DrawLogicBar(App& app, const Layout& layout) {
+void DrawSelectionOutline(App& app, const float* mvp, const Layout& layout) {
+    if (!mvp) return;
+    if (app.scene.selectedObject < 0 || app.scene.selectedObject >= static_cast<int>(app.scene.objects.size())) return;
+    const SceneObject& so = app.scene.objects[static_cast<size_t>(app.scene.selectedObject)];
+    if (so.boundsMin[0] > 1e29f) return;  // AABB 未计算
+    const VkRect2D& vp = layout.viewport;
+    if (vp.extent.width <= 0 || vp.extent.height <= 0) return;
+    // 【关键修复】本函数在 DrawMenu 之后调用，而 DrawMenu 内部切换了 menu/text 管线未恢复——
+    // DrawLine 不自行绑管线，必须在此显式恢复 2D 管线 + 顶点缓冲，否则选中框渲染错乱。
+    vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipelineUI);
+    VkDeviceSize voffSel = 0;
+    vkCmdBindVertexBuffers(app.vk.commandBuffer, 0, 1, &app.vk.vertexBuffer, &voffSel);
+    float model[16], mvpm[16];
+    BuildModelMatrix(so, model);
+    MatMul4(mvp, model, mvpm);
+    const float mn[3] = {so.boundsMin[0], so.boundsMin[1], so.boundsMin[2]};
+    const float mx[3] = {so.boundsMax[0], so.boundsMax[1], so.boundsMax[2]};
+    float c[8][4];
+    int idx = 0;
+    for (int zi = 0; zi < 2; ++zi) for (int yi = 0; yi < 2; ++yi) for (int xi = 0; xi < 2; ++xi) {
+        const float lx = xi ? mx[0] : mn[0], ly = yi ? mx[1] : mn[1], lz = zi ? mx[2] : mn[2];
+        const float v[4] = {lx, ly, lz, 1.0f};
+        float r[4] = {0,0,0,0};
+        for (int j = 0; j < 4; ++j) for (int k = 0; k < 4; ++k) r[j] += mvpm[j*4+k] * v[k];
+        c[idx][0] = r[0]; c[idx][1] = r[1]; c[idx][2] = r[2]; c[idx][3] = r[3];
+        ++idx;
+    }
+    bool valid[8];
+    auto proj = [&](int i, float& x, float& y) {
+        if (c[i][3] <= 0) { valid[i] = false; x = -1e9f; y = -1e9f; return; }  // 近平面后角：标记无效
+        valid[i] = true;
+        const float w = c[i][3];
+        x = (c[i][0] / w * 0.5f + 0.5f) * (float)vp.extent.width + (float)vp.offset.x;
+        y = (1.0f - (c[i][1] / w * 0.5f + 0.5f)) * (float)vp.extent.height + (float)vp.offset.y;
+    };
+    float p[8][2];
+    for (int i = 0; i < 8; ++i) proj(i, p[i][0], p[i][1]);
+    // clamp 屏幕坐标到 viewport 范围 + 余量（避免大模型顶点延伸无穷远；类似 Blender 选中框延伸被裁剪）
+    const float vw = (float)vp.extent.width, vh = (float)vp.extent.height;
+    const float margin = std::max(vw, vh) * 0.25f;
+    const float xmin = (float)vp.offset.x - margin, xmax = (float)vp.offset.x + vw + margin;
+    const float ymin = (float)vp.offset.y - margin, ymax = (float)vp.offset.y + vh + margin;
+    for (int i = 0; i < 8; ++i) {
+        p[i][0] = std::clamp(p[i][0], xmin, xmax);
+        p[i][1] = std::clamp(p[i][1], ymin, ymax);
+    }
+    static const int edges[12][2] = {
+        {0,1},{1,3},{3,2},{2,0},
+        {4,5},{5,7},{7,6},{6,4},
+        {0,4},{1,5},{2,6},{3,7}
+    };
+    const VkClearColorValue yb{{1.0f, 0.84f, 0.1f, 1.0f}};
+    for (auto& e : edges) {
+        if (!valid[e[0]] || !valid[e[1]]) continue;  // 两端都须在视锥内（近平面后角不连乱线）
+        DrawLine(app, vp, p[e[0]][0], p[e[0]][1], p[e[1]][0], p[e[1]][1], yb, 1.2f);
+    }
+}
+void DrawLogicBar(App& app, const Layout& layout, const float* mvp) {
     const uint32_t w = app.vk.swapchainExtent.width;
     const uint32_t h = app.vk.swapchainExtent.height;
 
@@ -1253,29 +1376,37 @@ void DrawLogicBar(App& app, const Layout& layout) {
         const VkRect2D& vp = layout.viewport;
         if (vp.extent.width > 0 && vp.extent.height > 0) {
             const uint64_t nowMs = GetTickCount64();
-            const float bw = std::min(360.0f, static_cast<float>(vp.extent.width) * 0.5f);
-            const float bh = 6.0f;
+            const float bw = std::min(560.0f, static_cast<float>(vp.extent.width) * 0.7f);  // 520→560 加大
+            const float bh = 18.0f;                                                          // 12→18 加粗
+            // 重做：移到【视口顶部居中下方 40px】（更醒目；不再贴视口底部易被忽略）
             const float bx = static_cast<float>(vp.offset.x) + (static_cast<float>(vp.extent.width) - bw) * 0.5f;
-            const float by = static_cast<float>(vp.offset.y) + static_cast<float>(vp.extent.height) - 48.0f;
+            const float by = static_cast<float>(vp.offset.y) + 40.0f;
             const float realProg = static_cast<float>(g_importProgress.load());
             app.ui.importDisplayProg = std::max(app.ui.importDisplayProg, realProg);
             app.ui.importDisplayProg += (realProg - app.ui.importDisplayProg) * 0.2f;
             const float prog = std::clamp(app.ui.importDisplayProg, 0.0f, 100.0f);
  VkClearColorValue bgCol = ThemeColor(ui::g_theme.slider.track, 0.85f); // 进度条轨道底色
  VkClearColorValue fillCol = ThemeColor(ui::g_theme.slider.fill); // 进度条填充（accent）
+            // 重做：进度条背景半透明黑底（与 3D 视口区分，提高可读性）
+            const VkClearColorValue panelBack{{0.0f, 0.0f, 0.0f, 0.55f}};
+            const float padX = 24.0f, padY = 18.0f;
+            const VkRect2D backRect{{static_cast<int32_t>(bx - padX), static_cast<int32_t>(by - padY)},
+                                    {static_cast<uint32_t>(bw + 2.0f * padX),
+                                     static_cast<uint32_t>(bh + 2.0f * padY + 28.0f)}};  // 高度+文字区
+            DrawPanel(app, {backRect, panelBack, 6.0f});
             const VkRect2D barRect{{static_cast<int32_t>(bx), static_cast<int32_t>(by)},
                                    {static_cast<uint32_t>(bw), static_cast<uint32_t>(bh)}};
-            DrawPanel(app, {barRect, bgCol, 3.0f});
+            DrawPanel(app, {barRect, bgCol, 9.0f});  // 6→9
             if (prog > 1.0f) {
                 const float fillW = bw * prog / 100.0f;
                 const VkRect2D fillRect{{static_cast<int32_t>(bx), static_cast<int32_t>(by)},
                                         {static_cast<uint32_t>(fillW), static_cast<uint32_t>(bh)}};
-                DrawPanel(app, {fillRect, fillCol, 3.0f});
+                DrawPanel(app, {fillRect, fillCol, 9.0f});
             }
             {
-                const float cx = bx - 18.0f;
+                const float cx = bx - 36.0f;          // 留出更大圆位
                 const float cy = by + bh * 0.5f;
-                const float rad = 8.0f;
+                const float rad = 22.0f;             // 16→22
                 const int segs = 12;
                 const float kTwoPi = 6.2831853f;
                 const float spin = static_cast<float>(nowMs % 500) / 500.0f * kTwoPi;
@@ -1293,16 +1424,16 @@ void DrawLogicBar(App& app, const Layout& layout) {
                     segCol.float32[3] = 0.25f + 0.75f * bright;
                     DrawLine(app, vp, cx + std::cos(a0) * rad, cy + std::sin(a0) * rad,
                                     cx + std::cos(a1) * rad, cy + std::sin(a1) * rad,
-                                    segCol, 2.2f);
+                                    segCol, 3.0f);  // 2.6→3.0 加粗
                 }
             }
- // GPU 上传阶段提示文字（进度条保持满条，真正完成才消失）
+ // GPU 上传阶段提示文字（重做：15→16 加大；位置对齐新顶部）
             if (g_importUploading.load() == 1) {
                 const wchar_t* msg = L"正在上传渲染数据…";
                 if (app.ui.importUpLabel.text != msg) {
                     std::vector<uint8_t> rgba;
                     int tw = 0, th = 0;
-                    if (RasterizeText(msg, 13, 2, L"Segoe UI", rgba, tw, th))
+                    if (RasterizeText(msg, 16, 2, L"Segoe UI", rgba, tw, th))
                         UploadLabelRgba(app, app.ui.importUpLabel, rgba, tw, th);
                 }
                 if (app.ui.importUpLabel.set != VK_NULL_HANDLE && app.ui.importUpLabel.w > 0) {
@@ -1358,25 +1489,24 @@ void DrawLogicBar(App& app, const Layout& layout) {
         const int px = layout.right.offset.x + kObjPanelPad;
         const int py = layout.right.offset.y + kObjPanelPad;
         const int pw = static_cast<int>(layout.right.extent.width) - 2 * kObjPanelPad;
- const int ph = 250; // 物体栏高度÷2（原 500）
-        const VkClearColorValue panelFill = kPanelColor;
+        // 面板高度固定：标题条 + 约 5 栏行高 + 边距（用户要求固定高度约 5 栏，不随物体数变化）
+        const int ph = kObjTitleH + kObjMaxRows * (kObjPanelRowH + kObjRowGap) + 2 * kObjPanelPad;
+        const VkClearColorValue panelFill = {{0.0f, 0.0f, 0.0f, 1.0f}};  // 与 3D 视口一样黑
         const VkClearColorValue whiteBorder = {{1.0f, 1.0f, 1.0f, 1.0f}};
         const VkClearColorValue selColor = ThemeColor(ui::g_theme.list.selected);
         vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipelineUI);
         VkDeviceSize off = 0;
         vkCmdBindVertexBuffers(app.vk.commandBuffer, 0, 1, &app.vk.vertexBuffer, &off);
-        // 面板：整体圆角 8px（卡片风格）
+        // 面板：整体圆角 4px（卡片风格，降低弧度）
         DrawPanel(app, {{{px - kObjPanelPad, py - kObjPanelPad},
                          {static_cast<uint32_t>(pw + 2 * kObjPanelPad), static_cast<uint32_t>(ph)}},
-                 panelFill, 8.0f, whiteBorder, 1.0f});
-        // 顶部标题条「物体列表」：深一档底色 + 白字（圆角顶）
+                 panelFill, 4.0f, whiteBorder, 1.0f});
+        // 顶部标题条「物体列表」：比黑面板略亮的深色 + 白字（圆角顶）
         {
             const VkRect2D titleRect{{px - kObjPanelPad, py - kObjPanelPad},
                                      {static_cast<uint32_t>(pw + 2 * kObjPanelPad), static_cast<uint32_t>(kObjTitleH)}};
-            VkClearColorValue tf;
-            for (int c = 0; c < 3; ++c) tf.float32[c] = panelFill.float32[c] * 0.55f;
-            tf.float32[3] = 1.0f;
-            DrawPanel(app, {titleRect, tf, 8.0f, VkClearColorValue{{0, 0, 0, 0}}, 0.0f});
+            const VkClearColorValue tf{{0.11f, 0.12f, 0.14f, 1.0f}};
+            DrawPanel(app, {titleRect, tf, 4.0f, VkClearColorValue{{0, 0, 0, 0}}, 0.0f});
             if (app.ui.objPanelTitle.set != VK_NULL_HANDLE && app.ui.objPanelTitle.w > 0) {
                 const VkRect2D tRect{
                     {titleRect.offset.x + (static_cast<int32_t>(titleRect.extent.width) - app.ui.objPanelTitle.w) / 2,
@@ -1385,32 +1515,69 @@ void DrawLogicBar(App& app, const Layout& layout) {
                 DrawIcon(app, tRect, kButtonIconColor, app.ui.objPanelTitle.set);
             }
         }
- // 物体栏行级按钮化——每行按按钮渲染（按钮主题色 normal + 悬停提亮 + 选中高亮，圆角行，行间 kObjRowGap 间距）
+ // 物体栏行（Blender Outliner 风格）：仅画可见 kObjMaxRows 行（从 objScroll 起）；选中=主题选中色整行，悬停=淡亮
         const int listY = py - kObjPanelPad + kObjTitleH;
         const int nRows = static_cast<int>(app.scene.objects.size());
-        for (int i = 0; i < nRows; ++i) {
-            const int ry = listY + i * (kObjPanelRowH + kObjRowGap);
+        const int listH = kObjMaxRows * (kObjPanelRowH + kObjRowGap);
+        const int maxScroll = (nRows > kObjMaxRows) ? (nRows - kObjMaxRows) : 0;
+        if (app.ui.objScroll > maxScroll) app.ui.objScroll = maxScroll;
+        if (app.ui.objScroll < 0) app.ui.objScroll = 0;
+        const VkClearColorValue kNoBorder{{0, 0, 0, 0}};
+        for (int vi = 0; vi < kObjMaxRows; ++vi) {
+            const int i = app.ui.objScroll + vi;   // 全局物体索引
+            if (i >= nRows) break;
+            const int ry = listY + vi * (kObjPanelRowH + kObjRowGap);
             const VkRect2D rowRect{{px, ry},
-                                   {static_cast<uint32_t>(pw), static_cast<uint32_t>(kObjPanelRowH)}};
+                                   {static_cast<uint32_t>(pw - (maxScroll > 0 ? 9 : 0)),
+                                    static_cast<uint32_t>(kObjPanelRowH)}};  // 有滚动条时行宽让出 9px
             const bool hovered =
                 app.gizmo.mouseX >= static_cast<float>(rowRect.offset.x) &&
                 app.gizmo.mouseX <  static_cast<float>(rowRect.offset.x + static_cast<int32_t>(rowRect.extent.width)) &&
                 app.gizmo.mouseY >= static_cast<float>(rowRect.offset.y) &&
                 app.gizmo.mouseY <  static_cast<float>(rowRect.offset.y + static_cast<int32_t>(rowRect.extent.height));
-            VkClearColorValue rc;
-            for (int c = 0; c < 4; ++c) rc.float32[c] = app.ui.buttonTheme.normal[c];
- if (i == app.scene.selectedObject) rc = selColor; // 选中高亮（主题选中色）
- else if (hovered) for (int c = 0; c < 3; ++c) rc.float32[c] = std::min(1.0f, app.ui.buttonTheme.normal[c] * 1.5f + 0.08f); // 悬停提亮
- DrawPanel(app, {rowRect, rc, 4.0f, rc, 0.0f}); // 圆角行（4px）
+            if (i == app.scene.selectedObject) {
+                DrawPanel(app, {rowRect, selColor, 0.0f, kNoBorder, 0.0f});  // 选中：蓝色整行（无圆角）
+                // 覆盖加粗白字（Blender 选中感：蓝条 + 加粗白字）
+                if (app.ui.objNameHighlight.set != VK_NULL_HANDLE && app.ui.objNameHighlight.w > 0) {
+                    const int32_t hx = rowRect.offset.x + 4;
+                    const int32_t hy = rowRect.offset.y + (rowRect.extent.height - app.ui.objNameHighlight.h) / 2;
+                    const int32_t hw = std::min<int32_t>(app.ui.objNameHighlight.w, static_cast<int32_t>(rowRect.extent.width) - 8);
+                    if (hw > 8) {
+                        DrawIcon(app, {{hx, hy}, {static_cast<uint32_t>(hw), static_cast<uint32_t>(app.ui.objNameHighlight.h)}},
+                                 VkClearColorValue{{1.0f, 1.0f, 1.0f, 1.0f}}, app.ui.objNameHighlight.set);
+                    }
+                }
+            } else if (hovered) {
+                VkClearColorValue hc;
+                for (int c = 0; c < 3; ++c) hc.float32[c] = std::min(1.0f, app.ui.buttonTheme.normal[c] * 1.15f + 0.05f);  // 淡亮
+                hc.float32[3] = 1.0f;
+                DrawPanel(app, {rowRect, hc, 0.0f, kNoBorder, 0.0f});  // 悬停：淡亮
+            }
         }
- // 全部物体名字列表（DrawIcon 内部切换 textPipeline；透明底白字，混合显示；纹理含 kObjRowGap 行间距）
+ // 物体名字列表（纹理仅含可见 kObjMaxRows 行，滚动时由 UpdateObjectLabels 重建）
         if (app.ui.objNameLabel.set != VK_NULL_HANDLE && app.ui.objNameLabel.w > 0) {
             const VkRect2D listRect{{px, listY},
                                     {static_cast<uint32_t>(app.ui.objNameLabel.w),
                                      static_cast<uint32_t>(app.ui.objNameLabel.h)}};
-            DrawIcon(app, listRect, VkClearColorValue{{0.88f, 0.88f, 0.88f, 1.0f}}, app.ui.objNameLabel.set);
+            DrawIcon(app, listRect, VkClearColorValue{{1.0f, 1.0f, 1.0f, 1.0f}}, app.ui.objNameLabel.set);
+        }
+ // 滚动条（物体数 > kObjMaxRows 时右侧显示）：轨道 + 滑块
+        if (maxScroll > 0) {
+            const int trackW = 5;
+            const int trackX = px + pw - trackW - 2;
+            const VkClearColorValue trackCol{{0.18f, 0.19f, 0.22f, 1.0f}};
+            const VkClearColorValue thumbCol{{0.42f, 0.45f, 0.52f, 1.0f}};
+            DrawPanel(app, {{{trackX, listY}, {trackW, static_cast<uint32_t>(listH)}}, trackCol, 0.0f, kNoBorder, 0.0f});
+            const int thumbH = std::max(18, listH * kObjMaxRows / nRows);
+            const int slide = listH - thumbH;
+            const int thumbY = listY + (maxScroll > 0 ? app.ui.objScroll * slide / maxScroll : 0);
+            DrawPanel(app, {{{trackX, thumbY}, {trackW, static_cast<uint32_t>(thumbH)}}, thumbCol, 0.0f, kNoBorder, 0.0f});
         }
     }
+
+    DrawMenu(app);
+
+    // 选中物体 AABB 黄框（2D HUD；按文件分布规则放 ui3d.cpp：clamp 屏幕坐标避免大模型顶点延伸无穷远）
     // 右上角系统按钮（最小化/最大化/关闭，PS 风格；悬停高亮，关闭红底白叉）
     {
         vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipelineUI);
@@ -1478,6 +1645,5 @@ void DrawLogicBar(App& app, const Layout& layout) {
             }
         }
     }
-
-    DrawMenu(app);
+    DrawSelectionOutline(app, mvp, layout);
 }

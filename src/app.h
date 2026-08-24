@@ -20,8 +20,8 @@
 
 // ---- Round358：面板布局默认尺寸（App 字段默认值 + 分隔线拖拽最小限制共用；ComputeLayout 单一来源）----
 constexpr uint32_t kTopBarHeight    = 36;    // 顶栏高（默认=最小）
-constexpr uint32_t kSideBarWidth    = 160;   // 右栏宽（默认=最小）
-constexpr uint32_t kLeftBarWidth    = 53;    // 左栏宽（160/3，缩小 3 倍；仅容 30px 按钮+留白）
+constexpr uint32_t kSideBarWidth    = 180;   // 右栏宽（默认=最小；160→180 加宽 20px）
+constexpr uint32_t kLeftBarWidth    = 48;    // 左栏宽（53→48 收窄 5px；仅容 30px 按钮+留白）
 constexpr uint32_t kBottomBarHeight = 150;   // 底部面板高（默认=最小）
 
 // ---- 按钮交互状态机（唯一的状态转换入口）----
@@ -317,6 +317,7 @@ struct App {
         UiButton sysButtons[3];              // 右上角：最小化/最大化/关闭（PS 风格）
         std::vector<VkRect2D> topDividers;   // 顶栏图标间竖直分割线（ComputeTopBar 计算，DrawLogicBar 绘制）
         bool maximized = false;              // 当前是否全屏铺满主显示器
+        bool pendingRestore = false;         // 最大化下按下未达 25px 阈值，延后还原（单击不动 = 不还原）
         bool minimized = false;              // 当前是否最小化（最小化期间停止渲染，避免交换链操作崩溃）
         bool captionDragging = false;        // 标题栏拖拽中（自定义拖拽：SetCapture 后由 WM_MOUSEMOVE 移动窗口）
         bool edgeResizing = false;           // 边缘缩放中（自定义缩放：1=左 2=右 3=底 4=左下 5=右下）
@@ -358,6 +359,8 @@ struct App {
         // 物体显示栏文字标签（选中变化时 RasterizeText→纹理重建）
         LabelTexture objNameLabel;   // 当前物体名称
         LabelTexture objPanelTitle;  // 右部物体栏标题条文字（"物体列表"，卡片控件方案B）
+        LabelTexture objNameHighlight; // 选中行加粗高亮文字（覆盖在蓝条上，Blender 选中感）
+        int objScroll = 0;           // 物体栏滚动偏移（行单位，超出 5 栏后滚轮/滑块滚动）
         LabelTexture scaleLabel;     // 缩放条数值文字（系统默认字体 Segoe UI）
         LabelTexture importUpLabel;  // GPU 上传中提示文字（"正在上传渲染数据…"）
         LabelTexture coordLabels[3] = {};   // 摄像机坐标 X/Y/Z 文字

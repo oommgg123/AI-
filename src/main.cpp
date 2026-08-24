@@ -396,12 +396,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 else if (bottom)           cid = 32645;  // IDC_SIZENS
                 if (cid) { SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(cid))); return TRUE; }
             }
-            // 3) 窗口移动检测区（顶栏最上 9px 空白，NCHITTEST 返回 HTCAPTION）→ 手势（32649=IDC_HAND）
-            if (wParam == HTCAPTION) {
-                static int dbgCursor = 0;
-                if (dbgCursor++ < 10) VkbLog("[dbg] SETCURSOR HTCAPTION");
-                SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32649)));
-                return TRUE;
+            // 3) 窗口移动检测区（顶栏最上 9px 空白）→ 手势（32649=IDC_HAND）。
+            // 按鼠标位置判定（不依赖 wParam：部分系统/时序下 WM_SETCURSOR 的 wParam 不可靠）
+            if (cye >= 0.0f && cye < 9.0f) {
+                bool onCtrl = PointInButton(app->ui.appIcon, cxe, cye);
+                for (auto& b : app->ui.buttons) if (PointInButton(b, cxe, cye)) onCtrl = true;
+                for (int i = 0; i < 3 && !onCtrl; ++i)
+                    if (PointInButton(app->ui.sysButtons[i], cxe, cye)) onCtrl = true;
+                if (!onCtrl) {
+                    static int dbgCursor = 0;
+                    if (dbgCursor++ < 10) VkbLog("[dbg] SETCURSOR HTCAPTION");
+                    SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32649)));
+                    return TRUE;
+                }
             }
         }
  return DefWindowProc(hwnd, msg, wParam, lParam); // 其余：默认箭头（本函数所有 case 均 return，不用 break）
@@ -437,26 +444,43 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_MOUSEWHEEL:
         if (App* app = GetApp(hwnd)) {
- // 取消滚轮缩放物体模型（用户要求）——滚轮仅缩放相机视角
+            // 鼠标在右部物体栏区域 → 滚动列表（物体数超出 5 栏时）；否则相机缩放
+            POINT pt{}; GetCursorPos(&pt);
+            platform::ScreenToClient(g_mainWindow, &pt);
+            const float mx = static_cast<float>(pt.x), my = static_cast<float>(pt.y);
+            const Layout layW = ComputeLayout(*app);
+            if (layW.right.extent.width >= 40 && layW.right.extent.height >= 100) {
+                const int lpx = layW.right.offset.x + kObjPanelPad;
+                const int lpy = layW.right.offset.y + kObjPanelPad + kObjTitleH;
+                const int lpW = static_cast<int>(layW.right.extent.width) - 2 * kObjPanelPad;
+                const int lpH = kObjMaxRows * (kObjPanelRowH + kObjRowGap);
+                if (mx >= lpx && mx < lpx + lpW && my >= lpy && my < lpy + lpH) {
+                    const int wheel = GET_WHEEL_DELTA_WPARAM(wParam);
+                    const int nAll = static_cast<int>(app->scene.objects.size());
+                    const int maxS = (nAll > kObjMaxRows) ? (nAll - kObjMaxRows) : 0;
+                    app->ui.objScroll = std::max(0, std::min(maxS, app->ui.objScroll - (wheel > 0 ? 1 : -1)));
+                    return 0;  // 滚动列表，不做相机缩放
+                }
+            }
+ // 滚轮缩放相机视角 → 显示左下角距离文字
             const int wheel = GET_WHEEL_DELTA_WPARAM(wParam);
- // 缩放 → 显示左下角距离文字
             app->ui.navLastActionMs = GetTickCount64();
             app->ui.navLastActionType = 2;
             app->camera.Zoom(static_cast<float>(wheel) / WHEEL_DELTA);
         }
         return 0;
- case WM_LBUTTONDBLCLK: // 双击物体栏名字 → 内联改名
+ case WM_LBUTTONDBLCLK: // 双击物体栏名字 → 内联改名（跟随新卡片布局：标题条偏移 + 行间距）
         if (App* app = GetApp(hwnd)) {
             const float mx = MouseX(lParam);
             const float my = MouseY(lParam);
             const Layout layR = ComputeLayout(*app);
             if (layR.right.extent.width >= 40 && layR.right.extent.height >= 100) {
                 const int px = layR.right.offset.x + kObjPanelPad;
-                const int py = layR.right.offset.y + kObjPanelPad;
+                const int py = layR.right.offset.y + kObjPanelPad + kObjTitleH;
                 const int pw = static_cast<int>(layR.right.extent.width) - 2 * kObjPanelPad;
-                const int ph = static_cast<int>(layR.right.extent.height) - 2 * kObjPanelPad;
+                const int ph = kObjMaxRows * (kObjPanelRowH + kObjRowGap);  // 固定约 5 栏行区域
                 if (mx >= px && mx < px + pw && my >= py && my < py + ph) {
-                    const int row = static_cast<int>((my - py) / kObjPanelRowH);
+                    const int row = static_cast<int>((my - py) / (kObjPanelRowH + kObjRowGap)) + app->ui.objScroll;
                     if (row >= 0 && row < static_cast<int>(app->scene.objects.size())) {
                         OpenRenameEdit(*app, row);
                         return 0;
@@ -543,9 +567,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     const int px = layR.right.offset.x + kObjPanelPad;
                     const int py = layR.right.offset.y + kObjPanelPad + kObjTitleH;
                     const int pw = static_cast<int>(layR.right.extent.width) - 2 * kObjPanelPad;
-                    const int ph = static_cast<int>(layR.right.extent.height) - 2 * kObjPanelPad - kObjTitleH;
+                    const int ph = kObjMaxRows * (kObjPanelRowH + kObjRowGap);  // 固定约 5 栏行区域
                     if (mx >= px && mx < px + pw && my >= py && my < py + ph) {
-                        const int row = static_cast<int>((my - py) / (kObjPanelRowH + kObjRowGap));
+                        const int row = static_cast<int>((my - py) / (kObjPanelRowH + kObjRowGap)) + app->ui.objScroll;
                         if (row >= 0 && row < static_cast<int>(app->scene.objects.size())) {
  // 已选中同一行 → 取消选择；否则选中该行单选清空框选多选
                             app->ui.multiSel.clear();
@@ -673,6 +697,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (app->ui.captionDragging) {
                 app->ui.captionDragging = false;
                 platform::ReleaseCapture();
+                // 最大化下延后还原但 <25px 释放 → 视为单击，不还原不吸附
+                if (app->ui.pendingRestore) {
+                    app->ui.pendingRestore = false;
+                    app->resizePending = true;
+                    return 0;
+                }
                 if (!platform::IsWindows11OrLater()) {
                     RECT wr{}, mw{}, wk{};
                     platform::GetWindowRect(g_mainWindow, &wr);
@@ -695,6 +725,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                      SWP_NOZORDER | SWP_FRAMECHANGED);
                     }
                 }
+                app->resizePending = true;  // 拖拽结束统一重建一次（拖拽中已暂停重建）
                 return 0;
             }
  // 自定义边缘缩放结束：仅释放捕获（尺寸已在 WM_MOUSEMOVE 实时更新）
@@ -702,6 +733,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 app->ui.edgeResizing = false;
                 app->ui.resizeEdge    = 0;
                 platform::ReleaseCapture();
+                app->resizePending = true;  // 缩放结束重建 swapchain（拖拽中已暂停）
                 return 0;
             }
  // 分隔线拖拽结束（尺寸已实时更新）
@@ -939,6 +971,29 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 POINT p{}; GetCursorPos(&p);
                 const int dx = p.x - app->ui.dragStartX;
                 const int dy = p.y - app->ui.dragStartY;
+                // 最大化下延后还原：累计位移 ≥25px 一次性还原 normalRect，之后正常移动窗口
+                if (app->ui.pendingRestore) {
+                    if (dx * dx + dy * dy >= 625) {  // 25*25
+                        app->ui.maximized = false;
+                        app->ui.pendingRestore = false;
+                        platform::SetWindowPos(g_mainWindow, nullptr,
+                            app->ui.normalRect.left, app->ui.normalRect.top,
+                            app->ui.normalRect.right - app->ui.normalRect.left,
+                            app->ui.normalRect.bottom - app->ui.normalRect.top,
+                            SWP_NOZORDER | SWP_FRAMECHANGED);
+                        platform::GetWindowRect(g_mainWindow, &app->ui.dragOrigRect);
+                        // 还原后重定起点，避免窗口跳到原最大化的鼠标偏移量
+                        app->ui.dragStartX = p.x;
+                        app->ui.dragStartY = p.y;
+                        // 首次还原后立即按当前位移设置位置
+                        const int nx2 = app->ui.dragOrigRect.left + (p.x - app->ui.dragStartX);
+                        const int ny2 = app->ui.dragOrigRect.top  + (p.y - app->ui.dragStartY);
+                        platform::SetWindowPos(g_mainWindow, nullptr, nx2, ny2, 0, 0,
+                                               SWP_NOSIZE | SWP_NOZORDER);
+                    }
+                    // <25px 期间：窗口不动（仍在最大化），等待用户继续拖动决定
+                    return 0;
+                }
                 const int nx = app->ui.dragOrigRect.left + dx;
                 const int ny = app->ui.dragOrigRect.top  + dy;
                 platform::SetWindowPos(g_mainWindow, nullptr, nx, ny, 0, 0,
@@ -1263,18 +1318,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 app->ui.dragStartX = static_cast<int>(LOWORD(lParam));
                 app->ui.dragStartY = static_cast<int>(HIWORD(lParam));
                 platform::GetWindowRect(g_mainWindow, &app->ui.dragOrigRect);
-                // 若当前已最大化：先还原到 normalRect，再以还原后位置为基准开始拖拽
-                // （避免从最大化态直接拖拽时窗口尺寸/位置错乱）
+                // 最大化下延后还原：移动 ≥25px 才视为拖动退出最大化（<25px 视为单击 → 不还原）
                 if (app->ui.maximized) {
-                    app->ui.maximized = false;
-                    platform::SetWindowPos(g_mainWindow, nullptr,
-                        app->ui.normalRect.left, app->ui.normalRect.top,
-                        app->ui.normalRect.right - app->ui.normalRect.left,
-                        app->ui.normalRect.bottom - app->ui.normalRect.top,
-                        SWP_NOZORDER | SWP_FRAMECHANGED);
-                    platform::GetWindowRect(g_mainWindow, &app->ui.dragOrigRect);
-                    app->ui.dragStartX = static_cast<int>(LOWORD(lParam));
-                    app->ui.dragStartY = static_cast<int>(HIWORD(lParam));
+                    app->ui.pendingRestore = true;
+                    platform::SetCapture(g_mainWindow);
+                    return 0;
                 }
                 platform::SetCapture(g_mainWindow);
                 return 0;
@@ -2078,33 +2126,44 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             // 窗口外 4px 热区：拖拽检测区 = 上边缘居中向外（窗口外上方 4px 也触发手势/拖拽）。
             // 鼠标在窗口外时消息到不了窗口，需主循环主动轮询光标：悬停显示手势；按住左键接管拖拽。
             // 注意：仅处理【窗口外】部分；窗口内 0~9px 由 WM_SETCURSOR/NCHITTEST 处理（避免抢按钮光标）。
+            // 防误触：按下后位移 ≥3px 才真正启动拖拽，避免"点击窗口上方桌面"误拖动窗口。
             {
+                static POINT sHotDown = {-100000, -100000};  // 热区按下起点（哨兵=未按下）
                 POINT hp{}; GetCursorPos(&hp);
                 RECT hwr{}; platform::GetWindowRect(g_mainWindow, &hwr);
                 const bool inHot = (hp.y >= hwr.top - 4 && hp.y < hwr.top &&
                                     hp.x >= hwr.left && hp.x <= hwr.right);
+                const bool lbtn = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
                 if (inHot) {
                     SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32649)));  // IDC_HAND 手势
-                    if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) &&
-                        !app.ui.captionDragging && !app.ui.edgeResizing) {
-                        app.ui.captionDragging = true;
-                        app.ui.edgeResizing   = false;
-                        app.ui.dragStartX = hp.x;
-                        app.ui.dragStartY = hp.y;
-                        platform::GetWindowRect(g_mainWindow, &app.ui.dragOrigRect);
-                        // 最大化时先还原 normalRect 再拖
-                        if (app.ui.maximized) {
-                            app.ui.maximized = false;
-                            platform::SetWindowPos(g_mainWindow, nullptr,
-                                app.ui.normalRect.left, app.ui.normalRect.top,
-                                app.ui.normalRect.right - app.ui.normalRect.left,
-                                app.ui.normalRect.bottom - app.ui.normalRect.top,
-                                SWP_NOZORDER | SWP_FRAMECHANGED);
-                            platform::GetWindowRect(g_mainWindow, &app.ui.dragOrigRect);
+                    if (lbtn && !app.ui.captionDragging && !app.ui.edgeResizing) {
+                        if (sHotDown.x == -100000) {
+                            sHotDown = hp;  // 记录按下起点
+                        } else {
+                            const int dx = hp.x - sHotDown.x, dy = hp.y - sHotDown.y;
+                            if (dx * dx + dy * dy >= 9) {  // 位移 ≥3px 启动拖拽
+                                sHotDown = {-100000, -100000};
+                                app.ui.captionDragging = true;
+                                app.ui.edgeResizing   = false;
+                                app.ui.dragStartX = hp.x;
+                                app.ui.dragStartY = hp.y;
+                                platform::GetWindowRect(g_mainWindow, &app.ui.dragOrigRect);
+                                // 最大化下延后还原：移动 ≥25px 才还原（<25px 视为单击不动）
+                                if (app.ui.maximized) {
+                                    app.ui.pendingRestore = true;
+                                    platform::SetCapture(g_mainWindow);
+                                    VkbLog("[dbg] HOTZONE drag start (maximized, pending)");
+                                } else {
+                                    platform::SetCapture(g_mainWindow);
+                                    VkbLog("[dbg] HOTZONE drag start");
+                                }
+                            }
                         }
-                        platform::SetCapture(g_mainWindow);
-                        VkbLog("[dbg] HOTZONE drag start");
+                    } else if (!lbtn) {
+                        sHotDown = {-100000, -100000};  // 松开复位
                     }
+                } else {
+                    sHotDown = {-100000, -100000};  // 离开热区复位
                 }
             }
             { static int s_run=0; if(s_run<6){++s_run; VkbLog("[run]");} }

@@ -503,18 +503,26 @@ void EndFrameAndPresent(App& app, uint32_t imageIndex) {
 void DrawFrame(App& app) {
     { static int s_de=0; if(s_de<4){++s_de; VkbLog("[df] enter");} }
     g_stage = "DrawFrame:交换链/acquire";
+    // 缩放拖拽中也需按新尺寸重建 swapchain（否则新尺寸区域黑屏/裁剪）；
+    // 但重建含 vkQueueWaitIdle，每帧重建卡顿 → 拖拽中节流 40ms（约 25fps 跟随），非拖拽立即重建。
     if (app.resizePending && app.vk.swapchain != VK_NULL_HANDLE) {
-        RECT cr{};
-        GetClientRect(app.hwnd, &cr);
-        const uint32_t cw = static_cast<uint32_t>(cr.right - cr.left);
-        const uint32_t ch = static_cast<uint32_t>(cr.bottom - cr.top);
-        app.resizePending = false;
-        if (cw == 0 || ch == 0) {
-            return;
-        }
-        if (cw != app.vk.swapchainExtent.width || ch != app.vk.swapchainExtent.height) {
-            if (!RecreateSwapchain(app)) {
+        static uint64_t s_lastRebuildMs = 0;
+        const uint64_t nowMs = GetTickCount64();
+        const bool dragging = app.ui.captionDragging || app.ui.edgeResizing;
+        if (!dragging || nowMs - s_lastRebuildMs >= 40) {
+            s_lastRebuildMs = nowMs;
+            RECT cr{};
+            GetClientRect(app.hwnd, &cr);
+            const uint32_t cw = static_cast<uint32_t>(cr.right - cr.left);
+            const uint32_t ch = static_cast<uint32_t>(cr.bottom - cr.top);
+            app.resizePending = false;
+            if (cw == 0 || ch == 0) {
                 return;
+            }
+            if (cw != app.vk.swapchainExtent.width || ch != app.vk.swapchainExtent.height) {
+                if (!RecreateSwapchain(app)) {
+                    return;
+                }
             }
         }
     }
@@ -898,9 +906,8 @@ void DrawFrame(App& app) {
         if (wirePipe == VK_NULL_HANDLE) wirePipe = app.vk.pipelineLine3d;
         if (wirePipe != VK_NULL_HANDLE) {
             for (const auto& obj : app.scene.objects) {
- // 选中物体跳过硬白线框——由黄色外轮廓高亮（避免白线覆盖）
-                if (app.scene.selectedObject >= 0 &&
-                    &obj == &app.scene.objects[static_cast<size_t>(app.scene.selectedObject)]) continue;
+                // 选中物体也画线框：线框模式下 mask pass 不产实体 → 黄外轮廓为空，
+                // 若再跳过选中物体会导致"选中物体线框消失"（白线框 + 黄轮廓叠加可见）。
                 const uint32_t wn = static_cast<uint32_t>(obj.wireIndices.size());
                 if (wn == 0) continue;
                 float model[16] = {};
@@ -1044,7 +1051,7 @@ void DrawFrame(App& app) {
     DrawCoordHud(app, layout);
 
     g_stage = "DrawFrame:逻辑栏/2D";
-    DrawLogicBar(app, layout);
+    DrawLogicBar(app, layout, mvp);
 
     EndFrameAndPresent(app, imageIndex);
 }

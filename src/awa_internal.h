@@ -44,7 +44,8 @@ constexpr float kLineWidth = 1.0f;
 constexpr int kObjPanelRowH = 22;
 constexpr int kObjPanelPad  = 8;
 constexpr int kObjTitleH    = 24;   // 物体栏顶部标题条高（卡片列表控件，方案B）
-constexpr int kObjRowGap    = 2;    // 物体栏行间距（卡片间距）
+constexpr int kObjRowGap    = 0;    // 物体栏行间距（Blender Outliner 紧凑风格：无间距）
+constexpr int kObjMaxRows   = 5;    // 物体栏固定显示栏数（用户要求固定高度约 5 栏）
 
 // 从 ui::g_theme 预设 COLORREF 转 Vulkan clear color（仅 2D UI 用；3D 视口/轴/gizmo 保持原样）
 inline VkClearColorValue ThemeColor(COLORREF c, float a = 1.0f) {
@@ -266,7 +267,7 @@ void ApplyRename(App& app);
 void CancelRename(App& app);
 void DrawIcon(App& app, const VkRect2D& iconRect, VkClearColorValue color, VkDescriptorSet set, bool white = true);
 void DrawLine(App& app, VkRect2D scissor, float ax, float ay, float bx, float by, VkClearColorValue color, float halfWidth);  void DrawLetter(App& app, VkRect2D scissor, char c, float cx, float cy, float size, VkClearColorValue color);
-void DrawLogicBar(App& app, const Layout& layout);
+void DrawLogicBar(App& app, const Layout& layout, const float* mvp = nullptr);
 void DrawMenu(App& app);
 void DrawPanel(App& app, const PanelSpec& panel);
 void FormatScaleLen(float len, char* buf, int n);
