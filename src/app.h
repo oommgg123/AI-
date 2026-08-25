@@ -21,7 +21,7 @@
 // ---- Round358：面板布局默认尺寸（App 字段默认值 + 分隔线拖拽最小限制共用；ComputeLayout 单一来源）----
 constexpr uint32_t kTopBarHeight    = 36;    // 顶栏高（默认=最小）
 constexpr uint32_t kSideBarWidth    = 180;   // 右栏宽（默认=最小；160→180 加宽 20px）
-constexpr uint32_t kLeftBarWidth    = 48;    // 左栏宽（53→48 收窄 5px；仅容 30px 按钮+留白）
+constexpr uint32_t kLeftBarWidth    = 43;    // 左栏宽（48→43 再收窄 5px；仅容 30px 按钮+留白）
 constexpr uint32_t kBottomBarHeight = 150;   // 底部面板高（默认=最小）
 
 // ---- 按钮交互状态机（唯一的状态转换入口）----
@@ -359,8 +359,17 @@ struct App {
         // 物体显示栏文字标签（选中变化时 RasterizeText→纹理重建）
         LabelTexture objNameLabel;   // 当前物体名称
         LabelTexture objPanelTitle;  // 右部物体栏标题条文字（"物体列表"，卡片控件方案B）
-        LabelTexture objNameHighlight; // 选中行加粗高亮文字（覆盖在蓝条上，Blender 选中感）
+        LabelTexture objNameHighlight; // 选中行加粗高亮文字（保留声明，当前已不用）
         int objScroll = 0;           // 物体栏滚动偏移（行单位，超出 5 栏后滚轮/滑块滚动）
+
+        // 物体栏单击/双击判定（0.2s）：文字范围内单击第一下不立即选中，0.2s 内第二击→重命名；超时→补选中
+        int objClickRow = -1;        // 待判定行（-1=无）
+        uint64_t objClickMs = 0;     // 第一击时间戳
+        // 物体栏左键框选（拖拽多选）：按下→移动>4px 进入框选；松开结算
+        bool objMarquee = false;     // 框选进行中
+        bool objMarqueePending = false;  // 按下未确认框选（等待移动判定）
+        float objMx0 = 0, objMy0 = 0;    // 框选起点
+        float objMx1 = 0, objMy1 = 0;    // 框选当前点
         LabelTexture scaleLabel;     // 缩放条数值文字（系统默认字体 Segoe UI）
         LabelTexture importUpLabel;  // GPU 上传中提示文字（"正在上传渲染数据…"）
         LabelTexture coordLabels[3] = {};   // 摄像机坐标 X/Y/Z 文字

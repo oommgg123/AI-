@@ -3,6 +3,9 @@
 // ============================================================================
 #include "awa_internal.h"
 
+extern std::atomic<int> g_importProgress;    // import_pipeline.h（renderer.cpp 检测进度条状态以决定是否隐藏 gizmo）
+extern std::atomic<int> g_importUploading;
+
 using std::uint32_t;
 
 // 上一帧 vkQueueSubmit 失败后栅栏已未置位且不会自行置位；置位此标志让下一帧跳过 vkWaitForFences，
@@ -961,9 +964,13 @@ void DrawFrame(App& app) {
     }
 
  // ===== 变换 gizmo移动三向标 / 旋转三色环 / 缩放轴+方块，按 gizmoMode 切换=====
-    if (app.ui.gizmoMode == 1) DrawRotateGizmo(app, mvp, layout.viewport);
-    else if (app.ui.gizmoMode == 2) DrawScaleGizmo(app, mvp, layout.viewport);
-    else DrawMoveGizmo(app, mvp, layout.viewport);
+    // 进度条显示期间隐藏 gizmo（避免 X/Y/Z 三轴彩色箭头与圆环与进度条视觉重叠——用户报告"彩色长条"）
+    const bool importing = (g_importProgress >= 0 && g_importProgress < 100) || g_importUploading.load() == 1;
+    if (!importing) {
+        if (app.ui.gizmoMode == 1) DrawRotateGizmo(app, mvp, layout.viewport);
+        else if (app.ui.gizmoMode == 2) DrawScaleGizmo(app, mvp, layout.viewport);
+        else DrawMoveGizmo(app, mvp, layout.viewport);
+    }
 
     DrawViewportGizmoIndicator(app, camView, layout, viewport, fullArea, vertexOffset);
 

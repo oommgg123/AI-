@@ -222,6 +222,7 @@ void BuildFeatureVerts(SceneObject& o);
 void BuildObjectWireframe(SceneObject& o);
 void BuildSelSilhouette(const SceneObject& o, App& app);
 void GizmoPivot(const SceneObject& o, float out[3]);
+void GizmoPivotSelected(App& app, float out[3]);   // 多选（框选）时取各物体中心中点
 void StartFreeDrag(App& app, HWND hwnd, float mx, float my);
 
 // ---- gizmo.cpp ----

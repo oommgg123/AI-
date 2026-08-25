@@ -132,6 +132,29 @@ void GizmoPivot(const SceneObject& o, float out[3]) {
     out[1] = (o.boundsMin[1] + o.boundsMax[1]) * 0.5f + o.ty;
     out[2] = (o.boundsMin[2] + o.boundsMax[2]) * 0.5f + o.tz;
 }
+void GizmoPivotSelected(App& app, float out[3]) {
+    // 多选（框选 multiSel>1）→ 取各物体中心的中点；否则单物体中心
+    const int n = static_cast<int>(app.ui.multiSel.size());
+    if (n > 1) {
+        out[0] = out[1] = out[2] = 0.0f;
+        int cnt = 0;
+        for (int idx : app.ui.multiSel) {
+            if (idx < 0 || idx >= static_cast<int>(app.scene.objects.size())) continue;
+            float p[3];
+            GizmoPivot(app.scene.objects[static_cast<size_t>(idx)], p);
+            out[0] += p[0]; out[1] += p[1]; out[2] += p[2];
+            ++cnt;
+        }
+        if (cnt > 0) { out[0] /= cnt; out[1] /= cnt; out[2] /= cnt; }
+        return;
+    }
+    if (app.scene.selectedObject < 0 ||
+        app.scene.selectedObject >= static_cast<int>(app.scene.objects.size())) {
+        out[0] = out[1] = out[2] = 0.0f;
+        return;
+    }
+    GizmoPivot(app.scene.objects[static_cast<size_t>(app.scene.selectedObject)], out);
+}
 float GizmoAxisLen(App& app, const float pivot[3], const VkRect2D& vp) {
     if (vp.extent.height <= 0) return 1.0f;
     const float dx = pivot[0] - app.camera.position.x;

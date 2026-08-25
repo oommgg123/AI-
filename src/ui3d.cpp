@@ -984,7 +984,7 @@ bool RasterizeNameList(const std::vector<std::wstring>& names, int width, int ro
     if (!bmp) { DeleteDC(hdc); return false; }
     HGDIOBJ oldBmp = SelectObject(hdc, bmp);
     std::memset(bits, 0, static_cast<size_t>(width) * h * 4);
-    HFONT font = CreateFontW(-14, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+    HFONT font = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,   // FW_NORMAL：选中/非选中均不加粗（用户要求）
                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                              CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"微软雅黑");
     HGDIOBJ oldFont = SelectObject(hdc, font);
@@ -1049,22 +1049,20 @@ void UpdateObjectLabels(App& app) {
     UploadLabelRgba(app, app.ui.objNameLabel, rgba, w, h);
     app.ui.objNameLabel.text = key;
 
-    // 选中行加粗高亮文字（Blender Outliner 选中感：蓝条 + 加粗白字覆盖）
+    // 选中行普通字（不加粗，FW_NORMAL 14px）覆盖在提亮底上——确保选中行文字可见
     {
         const int selGlobal = app.scene.selectedObject;
-        const int selKey = (selGlobal >= from && selGlobal < to) ? (selGlobal - from) : -1;  // 可见区内索引
+        const int selKey = (selGlobal >= from && selGlobal < to) ? (selGlobal - from) : -1;
         std::wstring hkey = L"h:" + std::to_wstring(selGlobal) + L":" + std::to_wstring(app.ui.objScroll);
         if (selKey < 0 || selGlobal < 0 || selGlobal >= nAll) {
-            // 选中行不可见：清空高亮纹理
             if (app.ui.objNameHighlight.text != hkey) {
                 app.ui.objNameHighlight.w = 0; app.ui.objNameHighlight.h = 0; app.ui.objNameHighlight.text = hkey;
             }
         } else if (app.ui.objNameHighlight.text != hkey) {
             const std::wstring& selName = app.scene.objects[static_cast<size_t>(selGlobal)].name;
-            // GDI 直接光栅化单行（FW_BOLD + 16px，与物体栏主题一致；纹理仅含选中行名字）
             HDC hdc = CreateCompatibleDC(nullptr);
             if (hdc) {
-                HFONT hf = CreateFontW(-16, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                HFONT hf = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,  // FW_NORMAL：不加粗
                                        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"微软雅黑");
                 if (hf) {
@@ -1081,7 +1079,7 @@ void UpdateObjectLabels(App& app) {
                         std::memset(bits, 0, (size_t)tw * th * 4);
                         SetTextColor(hdc, RGB(255, 255, 255));
                         SetBkMode(hdc, TRANSPARENT);
-                        RECT rc{3, 0, tw, th};
+                        RECT rc{0, 0, tw, th};  // 无左 padding：绘制时 hx=rowRect.x+2 与普通字对齐
                         DrawTextW(hdc, selName.c_str(), -1, &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
                         std::vector<uint8_t> hrgba((size_t)tw * th * 4);
                         const uint8_t* p = (const uint8_t*)bits;
@@ -1158,32 +1156,26 @@ void DrawSelectionOutline(App& app, const float* mvp, const Layout& layout) {
     MatMul4(mvp, model, mvpm);
     const float mn[3] = {so.boundsMin[0], so.boundsMin[1], so.boundsMin[2]};
     const float mx[3] = {so.boundsMax[0], so.boundsMax[1], so.boundsMax[2]};
-    float c[8][4];
+    // 【投影根因修复】旧代码 y 公式带 (1-…)×vh 翻转（OpenGL 习惯：y=+1 在顶部），但
+    // ProjectionMatrix 已内置 y 翻转（out[5]=-f）适配 Vulkan NDC（y=+1 在底部）→ 上下镜像错位。
+    // 直接复用已验证正确的 ProjectToViewport（gizmo 拾取同款投影），屏幕坐标与拾取/渲染完全一致。
+    VkViewport vv{static_cast<float>(vp.offset.x), static_cast<float>(vp.offset.y),
+                  static_cast<float>(vp.extent.width), static_cast<float>(vp.extent.height), 0.0f, 1.0f};
+    float p[8][2];
+    bool valid[8];
     int idx = 0;
     for (int zi = 0; zi < 2; ++zi) for (int yi = 0; yi < 2; ++yi) for (int xi = 0; xi < 2; ++xi) {
         const float lx = xi ? mx[0] : mn[0], ly = yi ? mx[1] : mn[1], lz = zi ? mx[2] : mn[2];
-        const float v[4] = {lx, ly, lz, 1.0f};
-        float r[4] = {0,0,0,0};
-        for (int j = 0; j < 4; ++j) for (int k = 0; k < 4; ++k) r[j] += mvpm[j*4+k] * v[k];
-        c[idx][0] = r[0]; c[idx][1] = r[1]; c[idx][2] = r[2]; c[idx][3] = r[3];
+        valid[idx] = ProjectToViewport(mvpm, vv, lx, ly, lz, p[idx][0], p[idx][1]);  // w≤0 → false（近平面后角）
         ++idx;
     }
-    bool valid[8];
-    auto proj = [&](int i, float& x, float& y) {
-        if (c[i][3] <= 0) { valid[i] = false; x = -1e9f; y = -1e9f; return; }  // 近平面后角：标记无效
-        valid[i] = true;
-        const float w = c[i][3];
-        x = (c[i][0] / w * 0.5f + 0.5f) * (float)vp.extent.width + (float)vp.offset.x;
-        y = (1.0f - (c[i][1] / w * 0.5f + 0.5f)) * (float)vp.extent.height + (float)vp.offset.y;
-    };
-    float p[8][2];
-    for (int i = 0; i < 8; ++i) proj(i, p[i][0], p[i][1]);
     // clamp 屏幕坐标到 viewport 范围 + 余量（避免大模型顶点延伸无穷远；类似 Blender 选中框延伸被裁剪）
     const float vw = (float)vp.extent.width, vh = (float)vp.extent.height;
     const float margin = std::max(vw, vh) * 0.25f;
     const float xmin = (float)vp.offset.x - margin, xmax = (float)vp.offset.x + vw + margin;
     const float ymin = (float)vp.offset.y - margin, ymax = (float)vp.offset.y + vh + margin;
     for (int i = 0; i < 8; ++i) {
+        if (!valid[i]) continue;  // 无效角（近平面后）不参与 clamp/绘制
         p[i][0] = std::clamp(p[i][0], xmin, xmax);
         p[i][1] = std::clamp(p[i][1], ymin, ymax);
     }
@@ -1192,9 +1184,54 @@ void DrawSelectionOutline(App& app, const float* mvp, const Layout& layout) {
         {4,5},{5,7},{7,6},{6,4},
         {0,4},{1,5},{2,6},{3,7}
     };
+    // 【背面剔除】实体/渲染模式（非线框）下，背向相机的面不画——只保留"至少一个面朝相机"的边；
+    // 线框模式（renderMode==1）画全部 12 边（透明可见背面）。CPU 6 次点积+查表，接近零成本。
+bool faceVis[6];
+    {
+        // 背面剔除：实体/渲染模式（非线框）下，背向相机的面不画。
+        // 判断 = 世界空间面法线 · (相机位置 - 面中心) > 0 → 面朝向相机（相机方向每帧由 app.camera.position 提供，随 orbit 更新）
+        static const float kFaceN[6][3] = {
+            {-1,0,0},{1,0,0},{0,-1,0},{0,1,0},{0,0,-1},{0,0,1}};
+        const float midX = (mn[0] + mx[0]) * 0.5f;
+        const float midY = (mn[1] + mx[1]) * 0.5f;
+        const float midZ = (mn[2] + mx[2]) * 0.5f;
+        const float fc[6][3] = {
+            {mn[0], midY, midZ}, {mx[0], midY, midZ},
+            {midX, mn[1], midZ}, {midX, mx[1], midZ},
+            {midX, midY, mn[2]}, {midX, midY, mx[2]}
+        };
+        for (int f = 0; f < 6; ++f) {
+            if (app.ui.renderMode == 1) { faceVis[f] = true; continue; }  // 线框模式不剔除
+            // 法线 → 世界（model 旋转部分；轴对齐法线方向不受非均匀缩放影响）
+            const float nw[3] = {
+                model[0]*kFaceN[f][0] + model[4]*kFaceN[f][1] + model[8]*kFaceN[f][2],
+                model[1]*kFaceN[f][0] + model[5]*kFaceN[f][1] + model[9]*kFaceN[f][2],
+                model[2]*kFaceN[f][0] + model[6]*kFaceN[f][1] + model[10]*kFaceN[f][2]
+            };
+            // 面中心 → 世界
+            const float cw[3] = {
+                model[0]*fc[f][0] + model[4]*fc[f][1] + model[8]*fc[f][2] + model[12],
+                model[1]*fc[f][0] + model[5]*fc[f][1] + model[9]*fc[f][2] + model[13],
+                model[2]*fc[f][0] + model[6]*fc[f][1] + model[10]*fc[f][2] + model[14]
+            };
+            faceVis[f] = (nw[0]*(app.camera.position.x - cw[0]) +
+                          nw[1]*(app.camera.position.y - cw[1]) +
+                          nw[2]*(app.camera.position.z - cw[2])) > 0.0f;  // 法线朝向相机
+        }
+    }
+    // 边 → 相邻面（每边 2 个面，索引同 kFaceN：f0=-X f1=+X f2=-Y f3=+Y f4=-Z f5=+Z）
+    // 重算：e1/e3/e5/e7 为 X 面（竖棱），其余为 Z/Y 面（e0-e3 底棱含 -Z、e4-e7 顶棱含 +Z、e8-e11 竖棱含 X）
+    static const int edgeFaces[12][2] = {
+        {2,4},{1,4},{3,4},{0,4},   // 底棱：e0{-Y,-Z} e1{+X,-Z} e2{+Y,-Z} e3{-X,-Z}
+        {2,5},{1,5},{3,5},{0,5},   // 顶棱：e4{-Y,+Z} e5{+X,+Z} e6{+Y,+Z} e7{-X,+Z}
+        {0,2},{1,2},{0,3},{1,3}    // 竖棱：e8{-X,-Y} e9{+X,-Y} e10{-X,+Y} e11{+X,+Y}
+    };
     const VkClearColorValue yb{{1.0f, 0.84f, 0.1f, 1.0f}};
-    for (auto& e : edges) {
-        if (!valid[e[0]] || !valid[e[1]]) continue;  // 两端都须在视锥内（近平面后角不连乱线）
+    for (int ei = 0; ei < 12; ++ei) {
+        const auto& e = edges[ei];
+        if (!valid[e[0]] || !valid[e[1]]) continue;  // 近平面后角不连乱线
+        if (app.ui.renderMode != 1 && !faceVis[edgeFaces[ei][0]] && !faceVis[edgeFaces[ei][1]])
+            continue;  // 实体/渲染模式：两个相邻面都背向相机 → 剔除该边（背面不画）
         DrawLine(app, vp, p[e[0]][0], p[e[0]][1], p[e[1]][0], p[e[1]][1], yb, 1.2f);
     }
 }
@@ -1450,36 +1487,6 @@ void DrawLogicBar(App& app, const Layout& layout, const float* mvp) {
  // 3D 视口比例尺左下角，表示当前摄像机缩放大小
     DrawScaleBar(app, layout);
 
- // 左键框选矩形（半透明蓝填充 + 白色细边）
-    if (app.ui.marqueeSelecting) {
-        const VkRect2D& vp = layout.viewport;
-        const float m0x = std::min(app.ui.marqueeX0, app.ui.marqueeX1);
-        const float m0y = std::min(app.ui.marqueeY0, app.ui.marqueeY1);
-        const float m1x = std::max(app.ui.marqueeX0, app.ui.marqueeX1);
-        const float m1y = std::max(app.ui.marqueeY0, app.ui.marqueeY1);
-        if (m1x - m0x >= 1.0f && m1y - m0y >= 1.0f) {
- const VkClearColorValue fill{{0.15f, 0.45f, 0.90f, 0.35f}}; // 半透明蓝（alpha=0.35，混合管线生效）
-            const VkClearColorValue noBorder{{0, 0, 0, 0}};
-            PanelSpec marq{};
-            marq.rect = {{static_cast<int32_t>(m0x), static_cast<int32_t>(m0y)},
-                         {static_cast<uint32_t>(m1x - m0x), static_cast<uint32_t>(m1y - m0y)}};
-            marq.fill = fill;
-            marq.radius = 0.0f;
-            marq.border = noBorder;
-            marq.borderWidth = 0.0f;
-            if (app.vk.pipelinePanelBlend != VK_NULL_HANDLE) {
-                vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipelinePanelBlend);
-            }
-            DrawPanel(app, marq);
-            const VkClearColorValue bcol{{1.0f, 1.0f, 1.0f, 1.0f}};
-            DrawLine(app, vp, m0x, m0y, m1x, m0y, bcol, 0.8f);
-            DrawLine(app, vp, m1x, m0y, m1x, m1y, bcol, 0.8f);
-            DrawLine(app, vp, m1x, m1y, m0x, m1y, bcol, 0.8f);
-            DrawLine(app, vp, m0x, m1y, m0x, m0y, bcol, 0.8f);
- // 恢复默认 2D 管线（半透明混合管线仅框选填充用）
-            vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipelineUI);
-        }
-    }
 
 
  // 右侧物体显示栏多物体名称列表，Blender 风格；点击行选中
@@ -1497,10 +1504,10 @@ void DrawLogicBar(App& app, const Layout& layout, const float* mvp) {
         vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipelineUI);
         VkDeviceSize off = 0;
         vkCmdBindVertexBuffers(app.vk.commandBuffer, 0, 1, &app.vk.vertexBuffer, &off);
-        // 面板：整体圆角 4px（卡片风格，降低弧度）
+        // 面板：整体圆角 4px（卡片风格，降低弧度）——边框延后到最后画（渲染顺序：内部→物体→框选→边缘）
         DrawPanel(app, {{{px - kObjPanelPad, py - kObjPanelPad},
                          {static_cast<uint32_t>(pw + 2 * kObjPanelPad), static_cast<uint32_t>(ph)}},
-                 panelFill, 4.0f, whiteBorder, 1.0f});
+                 panelFill, 4.0f, whiteBorder, 0.0f});  // borderWidth=0：边框移到最上层
         // 顶部标题条「物体列表」：比黑面板略亮的深色 + 白字（圆角顶）
         {
             const VkRect2D titleRect{{px - kObjPanelPad, py - kObjPanelPad},
@@ -1515,13 +1522,24 @@ void DrawLogicBar(App& app, const Layout& layout, const float* mvp) {
                 DrawIcon(app, tRect, kButtonIconColor, app.ui.objPanelTitle.set);
             }
         }
- // 物体栏行（Blender Outliner 风格）：仅画可见 kObjMaxRows 行（从 objScroll 起）；选中=主题选中色整行，悬停=淡亮
+// 物体名字列表（纹理仅含可见 kObjMaxRows 行，滚动时由 UpdateObjectLabels 重建）——最先画，作为非选中行的普通字
         const int listY = py - kObjPanelPad + kObjTitleH;
         const int nRows = static_cast<int>(app.scene.objects.size());
         const int listH = kObjMaxRows * (kObjPanelRowH + kObjRowGap);
         const int maxScroll = (nRows > kObjMaxRows) ? (nRows - kObjMaxRows) : 0;
         if (app.ui.objScroll > maxScroll) app.ui.objScroll = maxScroll;
         if (app.ui.objScroll < 0) app.ui.objScroll = 0;
+        if (app.ui.objNameLabel.set != VK_NULL_HANDLE && app.ui.objNameLabel.w > 0) {
+            const VkRect2D listRect{{px, listY},
+                                    {static_cast<uint32_t>(app.ui.objNameLabel.w),
+                                     static_cast<uint32_t>(app.ui.objNameLabel.h)}};
+            DrawIcon(app, listRect, VkClearColorValue{{1.0f, 1.0f, 1.0f, 1.0f}}, app.ui.objNameLabel.set);
+        }
+        // DrawIcon 切到 textPipeline 不恢复——行背景 DrawPanel 必须先重绑
+        vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipelineUI);
+        VkDeviceSize voffRow = 0;
+        vkCmdBindVertexBuffers(app.vk.commandBuffer, 0, 1, &app.vk.vertexBuffer, &voffRow);
+// 物体栏行（Blender Outliner 风格）：仅画可见 kObjMaxRows 行（从 objScroll 起）；选中=主题选中色整行，悬停=淡亮
         const VkClearColorValue kNoBorder{{0, 0, 0, 0}};
         for (int vi = 0; vi < kObjMaxRows; ++vi) {
             const int i = app.ui.objScroll + vi;   // 全局物体索引
@@ -1536,10 +1554,13 @@ void DrawLogicBar(App& app, const Layout& layout, const float* mvp) {
                 app.gizmo.mouseY >= static_cast<float>(rowRect.offset.y) &&
                 app.gizmo.mouseY <  static_cast<float>(rowRect.offset.y + static_cast<int32_t>(rowRect.extent.height));
             if (i == app.scene.selectedObject) {
-                DrawPanel(app, {rowRect, selColor, 0.0f, kNoBorder, 0.0f});  // 选中：蓝色整行（无圆角）
-                // 覆盖加粗白字（Blender 选中感：蓝条 + 加粗白字）
+                // 选中高亮（Blender Outliner 风格）：亮黄边 + 内部比黑面板略白一点点
+                VkClearColorValue hlFill{{0.14f, 0.15f, 0.17f, 1.0f}};          // 内部提亮（变白一点点，非纯黑）
+                const VkClearColorValue hlBorder{{1.0f, 0.84f, 0.1f, 1.0f}};   // 黄边（与选中框同黄）
+                DrawPanel(app, {rowRect, hlFill, 0.0f, hlBorder, 1.0f});       // 黄边 1px 无圆角
+                // 覆盖普通白字（不加粗 14px）确保选中行文字可见（DrawIcon 切 textPipeline，行循环结束后重绑）
                 if (app.ui.objNameHighlight.set != VK_NULL_HANDLE && app.ui.objNameHighlight.w > 0) {
-                    const int32_t hx = rowRect.offset.x + 4;
+                    const int32_t hx = rowRect.offset.x + 2;
                     const int32_t hy = rowRect.offset.y + (rowRect.extent.height - app.ui.objNameHighlight.h) / 2;
                     const int32_t hw = std::min<int32_t>(app.ui.objNameHighlight.w, static_cast<int32_t>(rowRect.extent.width) - 8);
                     if (hw > 8) {
@@ -1548,20 +1569,26 @@ void DrawLogicBar(App& app, const Layout& layout, const float* mvp) {
                     }
                 }
             } else if (hovered) {
+                // 悬停高亮**半透明**（alpha 0.35 + blend 管线）——底下的物体名文字透出，不再被遮挡
                 VkClearColorValue hc;
-                for (int c = 0; c < 3; ++c) hc.float32[c] = std::min(1.0f, app.ui.buttonTheme.normal[c] * 1.15f + 0.05f);  // 淡亮
-                hc.float32[3] = 1.0f;
-                DrawPanel(app, {rowRect, hc, 0.0f, kNoBorder, 0.0f});  // 悬停：淡亮
+                for (int c = 0; c < 3; ++c) hc.float32[c] = std::min(1.0f, app.ui.buttonTheme.normal[c] * 1.15f + 0.05f);
+                hc.float32[3] = 0.35f;
+                if (app.vk.pipelinePanelBlend != VK_NULL_HANDLE) {
+                    vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipelinePanelBlend);
+                    VkDeviceSize voffHv = 0;
+                    vkCmdBindVertexBuffers(app.vk.commandBuffer, 0, 1, &app.vk.vertexBuffer, &voffHv);
+                }
+                DrawPanel(app, {rowRect, hc, 0.0f, kNoBorder, 0.0f});  // 悬停：淡亮（半透明）
+                vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipelineUI);
+                VkDeviceSize voffHvR = 0;
+                vkCmdBindVertexBuffers(app.vk.commandBuffer, 0, 1, &app.vk.vertexBuffer, &voffHvR);
             }
         }
- // 物体名字列表（纹理仅含可见 kObjMaxRows 行，滚动时由 UpdateObjectLabels 重建）
-        if (app.ui.objNameLabel.set != VK_NULL_HANDLE && app.ui.objNameLabel.w > 0) {
-            const VkRect2D listRect{{px, listY},
-                                    {static_cast<uint32_t>(app.ui.objNameLabel.w),
-                                     static_cast<uint32_t>(app.ui.objNameLabel.h)}};
-            DrawIcon(app, listRect, VkClearColorValue{{1.0f, 1.0f, 1.0f, 1.0f}}, app.ui.objNameLabel.set);
-        }
- // 滚动条（物体数 > kObjMaxRows 时右侧显示）：轨道 + 滑块
+        // 行循环内选中行 DrawIcon 切走了管线——滚动条 DrawPanel 前重绑 pipelineUI
+        vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipelineUI);
+        VkDeviceSize voffScr = 0;
+        vkCmdBindVertexBuffers(app.vk.commandBuffer, 0, 1, &app.vk.vertexBuffer, &voffScr);
+        // 滚动条（物体数 > kObjMaxRows 时右侧显示）：轨道 + 滑块
         if (maxScroll > 0) {
             const int trackW = 5;
             const int trackX = px + pw - trackW - 2;
@@ -1572,6 +1599,50 @@ void DrawLogicBar(App& app, const Layout& layout, const float* mvp) {
             const int slide = listH - thumbH;
             const int thumbY = listY + (maxScroll > 0 ? app.ui.objScroll * slide / maxScroll : 0);
             DrawPanel(app, {{{trackX, thumbY}, {trackW, static_cast<uint32_t>(thumbH)}}, thumbCol, 0.0f, kNoBorder, 0.0f});
+        }
+        // 物体栏边缘（白边圆角）：画在内容之上、框选之下
+        // 用 pipelinePanelBlend + **透明 fill**（alpha 保留后不覆盖内部内容）+ 白边 1px 圆角 4px
+        {
+            if (app.vk.pipelinePanelBlend != VK_NULL_HANDLE) {
+                vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipelinePanelBlend);
+                VkDeviceSize voffEdge = 0;
+                vkCmdBindVertexBuffers(app.vk.commandBuffer, 0, 1, &app.vk.vertexBuffer, &voffEdge);
+            }
+            const VkRect2D edgeRect{{px - kObjPanelPad, py - kObjPanelPad},
+                                    {static_cast<uint32_t>(pw + 2 * kObjPanelPad), static_cast<uint32_t>(ph)}};
+            const VkClearColorValue kTransparent{{0.0f, 0.0f, 0.0f, 0.0f}};  // 透明内部（不覆盖内容）
+            DrawPanel(app, {edgeRect, kTransparent, 4.0f, whiteBorder, 1.0f});  // 圆角 4px + 白边 1px
+            vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipelineUI);
+            VkDeviceSize voffEdgeR = 0;
+            vkCmdBindVertexBuffers(app.vk.commandBuffer, 0, 1, &app.vk.vertexBuffer, &voffEdgeR);
+        }
+        // 物体栏左键框选矩形（**最高优先级**，画在边缘之上）：clamp 到列表区（px,py,pw,ph）内
+        if (app.ui.objMarquee) {
+            const float fx0 = std::max(static_cast<float>(px), std::min(app.ui.objMx0, app.ui.objMx1));
+            const float fy0 = std::max(static_cast<float>(py), std::min(app.ui.objMy0, app.ui.objMy1));
+            const float fx1 = std::min(static_cast<float>(px + pw), std::max(app.ui.objMx0, app.ui.objMx1));
+            const float fy1 = std::min(static_cast<float>(py + ph), std::max(app.ui.objMy0, app.ui.objMy1));
+            if (fx1 - fx0 >= 1.0f && fy1 - fy0 >= 1.0f) {
+                const VkRect2D mqRect{{static_cast<int32_t>(fx0), static_cast<int32_t>(fy0)},
+                                      {static_cast<uint32_t>(fx1 - fx0 + 0.5f), static_cast<uint32_t>(fy1 - fy0 + 0.5f)}};
+                // 填充：半透明蓝（pipelinePanelBlend 混合；pipelineUI 不混合 alpha 失效）
+                if (app.vk.pipelinePanelBlend != VK_NULL_HANDLE) {
+                    vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipelinePanelBlend);
+                    VkDeviceSize voffBlend = 0;
+                    vkCmdBindVertexBuffers(app.vk.commandBuffer, 0, 1, &app.vk.vertexBuffer, &voffBlend);
+                }
+                const VkClearColorValue mqFill{{0.26f, 0.48f, 0.88f, 0.18f}};   // 半透明蓝填充
+                DrawPanel(app, {mqRect, mqFill, 0.0f, VkClearColorValue{{0,0,0,0}}, 0.0f});
+                // 线框：4 条 DrawLine **不透明**亮蓝（pipelineUI 直出，blend 边框 alpha 强制 1.0 会盖内容故用线）
+                vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipelineUI);
+                VkDeviceSize voffMq = 0;
+                vkCmdBindVertexBuffers(app.vk.commandBuffer, 0, 1, &app.vk.vertexBuffer, &voffMq);
+                const VkClearColorValue mqBorder{{0.45f, 0.68f, 1.0f, 1.0f}};   // 亮蓝边（不透明）
+                DrawLine(app, mqRect, fx0, fy0, fx1, fy0, mqBorder, 1.0f);
+                DrawLine(app, mqRect, fx0, fy1, fx1, fy1, mqBorder, 1.0f);
+                DrawLine(app, mqRect, fx0, fy0, fx0, fy1, mqBorder, 1.0f);
+                DrawLine(app, mqRect, fx1, fy0, fx1, fy1, mqBorder, 1.0f);
+            }
         }
     }
 
@@ -1619,19 +1690,20 @@ void DrawLogicBar(App& app, const Layout& layout, const float* mvp) {
                     const float gs = 5.0f;
                     DrawLine(app, s.rect, cx - gs, cy - gs, cx + gs, cy + gs, col, lw);
                     DrawLine(app, s.rect, cx - gs, cy + gs, cx + gs, cy - gs, col, lw);
-                } else if (i == 1) {                // 最大化按钮：手绘图标（白渲染通道）；已最大化显示"还原"双矩形，否则单矩形
-                    const float r = 4.0f;           // 半幅（#4：方框半幅 5.0→4.0，细线）
-                    const float o = 1.6f;           // 还原图标两矩形偏移量
+                } else if (i == 1) {                // 最大化按钮：手绘图标（白渲染通道）；已最大化显示"还原"双矩形（Win11 风格）
+                    const float r = 4.0f;           // 半幅（方框半幅 5.0→4.0，细线）
+                    const float o = 2.5f;           // 双矩形偏移量（部分重叠，背景露 2 条边）
                     if (app.ui.maximized) {
-                        // 还原图标：两个重叠矩形（左下在前、右上在后）
-                        DrawLine(app, s.rect, cx + o - r, cy - o - r, cx + o + r, cy - o - r, col, lw);
-                        DrawLine(app, s.rect, cx + o - r, cy - o + r, cx + o + r, cy - o + r, col, lw);
-                        DrawLine(app, s.rect, cx + o - r, cy - o - r, cx + o - r, cy - o + r, col, lw);
-                        DrawLine(app, s.rect, cx + o + r, cy - o - r, cx + o + r, cy - o + r, col, lw);
-                        DrawLine(app, s.rect, cx - o - r, cy + o - r, cx - o + r, cy + o - r, col, lw);
-                        DrawLine(app, s.rect, cx - o - r, cy + o + r, cx - o + r, cy + o + r, col, lw);
-                        DrawLine(app, s.rect, cx - o - r, cy + o - r, cx - o - r, cy + o + r, col, lw);
-                        DrawLine(app, s.rect, cx - o + r, cy + o - r, cx - o + r, cy + o + r, col, lw);
+                        // 还原图标（已最大化）：QQ Win11 风格重叠双框
+                        // 前景方框在右上（完整 4 条边），背景方框在左下（只露左+下两条边，右+上被前景遮）
+                        // 前景方框右上：4 边
+                        DrawLine(app, s.rect, cx + o - r, cy - o - r, cx + o + r, cy - o - r, col, lw);  // 上
+                        DrawLine(app, s.rect, cx + o - r, cy - o + r, cx + o + r, cy - o + r, col, lw);  // 下
+                        DrawLine(app, s.rect, cx + o - r, cy - o - r, cx + o - r, cy - o + r, col, lw);  // 左
+                        DrawLine(app, s.rect, cx + o + r, cy - o - r, cx + o + r, cy - o + r, col, lw);  // 右
+                        // 背景方框左下：只画"左 + 下"两条（QQ 风格伸出部分）
+                        DrawLine(app, s.rect, cx - o - r, cy + o - r, cx - o - r, cy + o + r, col, lw);  // 左
+                        DrawLine(app, s.rect, cx - o - r, cy + o + r, cx - o + r, cy + o + r, col, lw);  // 下
                     } else {
                         // 最大化图标：单矩形
                         DrawLine(app, s.rect, cx - r, cy - r, cx + r, cy - r, col, lw);
@@ -1643,6 +1715,36 @@ void DrawLogicBar(App& app, const Layout& layout, const float* mvp) {
                     DrawLine(app, s.rect, cx - 5.0f, cy, cx + 5.0f, cy, col, lw);
                 }
             }
+        }
+    }
+ // 左键框选矩形（半透明蓝填充 + 白色细边）
+    if (app.ui.marqueeSelecting) {
+        const VkRect2D& vp = layout.viewport;
+        const float m0x = std::min(app.ui.marqueeX0, app.ui.marqueeX1);
+        const float m0y = std::min(app.ui.marqueeY0, app.ui.marqueeY1);
+        const float m1x = std::max(app.ui.marqueeX0, app.ui.marqueeX1);
+        const float m1y = std::max(app.ui.marqueeY0, app.ui.marqueeY1);
+        if (m1x - m0x >= 1.0f && m1y - m0y >= 1.0f) {
+ const VkClearColorValue fill{{0.15f, 0.45f, 0.90f, 0.35f}}; // 半透明蓝（alpha=0.35，混合管线生效）
+            const VkClearColorValue noBorder{{0, 0, 0, 0}};
+            PanelSpec marq{};
+            marq.rect = {{static_cast<int32_t>(m0x), static_cast<int32_t>(m0y)},
+                         {static_cast<uint32_t>(m1x - m0x), static_cast<uint32_t>(m1y - m0y)}};
+            marq.fill = fill;
+            marq.radius = 0.0f;
+            marq.border = noBorder;
+            marq.borderWidth = 0.0f;
+            if (app.vk.pipelinePanelBlend != VK_NULL_HANDLE) {
+                vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipelinePanelBlend);
+            }
+            DrawPanel(app, marq);
+            const VkClearColorValue bcol{{1.0f, 1.0f, 1.0f, 1.0f}};
+            DrawLine(app, vp, m0x, m0y, m1x, m0y, bcol, 0.8f);
+            DrawLine(app, vp, m1x, m0y, m1x, m1y, bcol, 0.8f);
+            DrawLine(app, vp, m1x, m1y, m0x, m1y, bcol, 0.8f);
+            DrawLine(app, vp, m0x, m1y, m0x, m0y, bcol, 0.8f);
+ // 恢复默认 2D 管线（半透明混合管线仅框选填充用）
+            vkCmdBindPipeline(app.vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipelineUI);
         }
     }
     DrawSelectionOutline(app, mvp, layout);

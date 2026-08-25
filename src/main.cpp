@@ -469,26 +469,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             app->camera.Zoom(static_cast<float>(wheel) / WHEEL_DELTA);
         }
         return 0;
- case WM_LBUTTONDBLCLK: // 双击物体栏名字 → 内联改名（跟随新卡片布局：标题条偏移 + 行间距）
-        if (App* app = GetApp(hwnd)) {
-            const float mx = MouseX(lParam);
-            const float my = MouseY(lParam);
-            const Layout layR = ComputeLayout(*app);
-            if (layR.right.extent.width >= 40 && layR.right.extent.height >= 100) {
-                const int px = layR.right.offset.x + kObjPanelPad;
-                const int py = layR.right.offset.y + kObjPanelPad + kObjTitleH;
-                const int pw = static_cast<int>(layR.right.extent.width) - 2 * kObjPanelPad;
-                const int ph = kObjMaxRows * (kObjPanelRowH + kObjRowGap);  // 固定约 5 栏行区域
-                if (mx >= px && mx < px + pw && my >= py && my < py + ph) {
-                    const int row = static_cast<int>((my - py) / (kObjPanelRowH + kObjRowGap)) + app->ui.objScroll;
-                    if (row >= 0 && row < static_cast<int>(app->scene.objects.size())) {
-                        OpenRenameEdit(*app, row);
-                        return 0;
-                    }
-                }
-            }
-        }
-        return DefWindowProc(hwnd, msg, wParam, lParam);
+    case WM_LBUTTONDBLCLK:
+        // 双击改名已并入 WM_LBUTTONUP 的 0.2s 判定（双击 = 两次 LBUTTONDOWN/UP，第一击不选中第二击改名）；
+        // 此处吞掉 DBLCLK，避免 Windows 双击消息与两次 UP 处理冲突（双重触发改名）。
+        return 0;
     case WM_LBUTTONDOWN:
         if (App* app = GetApp(hwnd)) {
             const float mx = MouseX(lParam);
@@ -569,19 +553,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     const int pw = static_cast<int>(layR.right.extent.width) - 2 * kObjPanelPad;
                     const int ph = kObjMaxRows * (kObjPanelRowH + kObjRowGap);  // 固定约 5 栏行区域
                     if (mx >= px && mx < px + pw && my >= py && my < py + ph) {
-                        const int row = static_cast<int>((my - py) / (kObjPanelRowH + kObjRowGap)) + app->ui.objScroll;
-                        if (row >= 0 && row < static_cast<int>(app->scene.objects.size())) {
- // 已选中同一行 → 取消选择；否则选中该行单选清空框选多选
-                            app->ui.multiSel.clear();
-                            if (app->scene.selectedObject == row) {
-                                app->scene.selectedObject = -1;
-                                app->scene.wireframeSel = false;
-                            } else {
-                                app->scene.selectedObject = row;
-                                app->scene.wireframeSel = false;
-                            }
-                        }
+                        // 左键按下：记录框选起点，等待移动判定（>4px 进入框选）；不立即选中
+                        // （选中/重命名在松开时按 0.2s 双击判定处理）
+                        app->ui.objMarqueePending = true;
+                        app->ui.objMx0 = mx; app->ui.objMy0 = my;
+                        app->ui.objMx1 = mx; app->ui.objMy1 = my;
  app->scene.mouseDragged = true; // 屏蔽松开时的物体拾取
+                        platform::SetCapture(g_mainWindow);
                         return 0;
                     }
                 }
@@ -736,6 +714,65 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 app->resizePending = true;  // 缩放结束重建 swapchain（拖拽中已暂停）
                 return 0;
             }
+ // 物体栏左键松开：框选结算 / 单击 0.2s 双击判定
+            if (app->ui.objMarqueePending || app->ui.objMarquee) {
+                app->ui.objMarqueePending = false;
+                const float ux = MouseX(lParam), uy = MouseY(lParam);
+                const Layout layU = ComputeLayout(*app);
+                if (app->ui.objMarquee) {
+                    app->ui.objMarquee = false;
+                    app->ui.objClickRow = -1;  // 框选完成：取消未决的单击判定
+                    const int px = layU.right.offset.x + kObjPanelPad;
+                    const int py = layU.right.offset.y + kObjPanelPad + kObjTitleH;
+                    const int pw = static_cast<int>(layU.right.extent.width) - 2 * kObjPanelPad;
+                    const float x0 = std::min(app->ui.objMx0, ux), x1 = std::max(app->ui.objMx0, ux);
+                    const float y0 = std::min(app->ui.objMy0, uy), y1 = std::max(app->ui.objMy0, uy);
+                    if (x1 - x0 >= 4.0f && y1 - y0 >= 4.0f) {
+                        // 框选结算：行矩形与框选矩形相交 → 多选（主操作对象 = 最后一个框内行）
+                        app->ui.multiSel.clear();
+                        int lastSel = -1;
+                        for (int vi = 0; vi < kObjMaxRows; ++vi) {
+                            const int row = app->ui.objScroll + vi;
+                            if (row >= static_cast<int>(app->scene.objects.size())) break;
+                            const float ry0 = static_cast<float>(py + vi * (kObjPanelRowH + kObjRowGap));
+                            const float ry1 = ry0 + kObjPanelRowH;
+                            const float rx0 = static_cast<float>(px), rx1 = static_cast<float>(px + pw);
+                            if (rx0 <= x1 && rx1 >= x0 && ry0 <= y1 && ry1 >= y0) {
+                                app->ui.multiSel.push_back(row);
+                                lastSel = row;
+                            }
+                        }
+                        app->scene.wireframeSel = false;
+                        if (lastSel >= 0) {
+                            app->scene.selectedObject = lastSel;  // 主操作对象 = 最后一个框内行
+                        } else {
+                            app->scene.selectedObject = -1;
+                            app->ui.multiSel.clear();
+                        }
+                    }
+                } else {
+                    // 单击（未拖拽）：0.2s 判定——第一击不选中；0.2s 内第二击 → 重命名
+                    const int px = layU.right.offset.x + kObjPanelPad;
+                    const int py = layU.right.offset.y + kObjPanelPad + kObjTitleH;
+                    const int pw = static_cast<int>(layU.right.extent.width) - 2 * kObjPanelPad;
+                    const int ph = kObjMaxRows * (kObjPanelRowH + kObjRowGap);
+                    if (ux >= px && ux < px + pw && uy >= py && uy < py + ph) {
+                        const int row = static_cast<int>((uy - py) / (kObjPanelRowH + kObjRowGap)) + app->ui.objScroll;
+                        const uint64_t nowMs = GetTickCount64();
+                        if (app->ui.objClickRow == row && nowMs - app->ui.objClickMs < 400) {
+                            app->ui.objClickRow = -1;   // 0.2s 内第二击 → 重命名
+                            OpenRenameEdit(*app, row);
+                        } else {
+                            app->ui.objClickRow = row;  // 第一击：记录待判定（不立即选中）
+                            app->ui.objClickMs = nowMs;
+                        }
+                    } else {
+                        app->ui.objClickRow = -1;  // 点在物体栏外：取消待判定
+                    }
+                }
+                platform::ReleaseCapture();
+                return 0;
+            }
  // 分隔线拖拽结束（尺寸已实时更新）
             if (app->ui.resizeDrag >= 0) {
                 app->ui.resizeDrag = -1;
@@ -888,8 +925,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_MBUTTONDOWN:
         if (App* app = GetApp(hwnd)) {
- // 中键 = 框选目标（原左键功能）——空白处按下开始框选
- // （中键不操作 gizmo，无需 gizmo/UI 命中检测；滚轮缩放由 WM_MOUSEWHEEL 单独处理）
+ // 中键 = 框选目标（原左键功能）——**任意位置按下都触发**（含 2D UI 面板）
+ // 框选矩形渲染优先级最高（画在 2D UI 之后），不被面板遮挡
             app->ui.menuOpen = false;
             app->ui.marqueeSelecting = true;
             app->ui.marqueeX0 = MouseX(lParam); app->ui.marqueeY0 = MouseY(lParam);
@@ -998,6 +1035,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 const int ny = app->ui.dragOrigRect.top  + dy;
                 platform::SetWindowPos(g_mainWindow, nullptr, nx, ny, 0, 0,
                                        SWP_NOSIZE | SWP_NOZORDER);
+                return 0;
+            }
+            // 物体栏左键框选：按下后移动 >4px 进入框选模式（绘制/结算见 DrawLogicBar 与 LBUTTONUP）
+            if (app->ui.objMarqueePending && !app->ui.objMarquee) {
+                const float mxc = MouseX(lParam), myc = MouseY(lParam);
+                const float dxm = mxc - app->ui.objMx0, dym = myc - app->ui.objMy0;
+                if (dxm * dxm + dym * dym >= 16.0f) app->ui.objMarquee = true;  // 位移 ≥4px
+            }
+            if (app->ui.objMarquee) {
+                app->ui.objMx1 = MouseX(lParam);
+                app->ui.objMy1 = MouseY(lParam);
                 return 0;
             }
             // 自定义边缘缩放：按边缘调整窗口尺寸（实时更新，释放时不再重算尺寸）
@@ -2123,6 +2171,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         }
 
         if (app.running) {
+            // 物体栏单击超时补选（0.2s 内无第二击 → 第一击生效为选中；双击第二击走重命名）
+            if (app.ui.objClickRow >= 0 &&
+                app.ui.objClickRow < static_cast<int>(app.scene.objects.size()) &&
+                GetTickCount64() - app.ui.objClickMs > 400) {
+                const int row = app.ui.objClickRow;
+                app.ui.objClickRow = -1;
+                app.ui.multiSel.clear();
+                if (app.scene.selectedObject == row) {
+                    app.scene.selectedObject = -1;  // 点击已选中行 → 取消选择
+                } else {
+                    app.scene.selectedObject = row;
+                }
+                app.scene.wireframeSel = false;
+            }
             // 窗口外 4px 热区：拖拽检测区 = 上边缘居中向外（窗口外上方 4px 也触发手势/拖拽）。
             // 鼠标在窗口外时消息到不了窗口，需主循环主动轮询光标：悬停显示手势；按住左键接管拖拽。
             // 注意：仅处理【窗口外】部分；窗口内 0~9px 由 WM_SETCURSOR/NCHITTEST 处理（避免抢按钮光标）。
